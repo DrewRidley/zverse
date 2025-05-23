@@ -16,7 +16,7 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use rand::prelude::*;
-use zverse::encoding::morton::{morton_t_encode, morton_t_bigmin, morton_t_litmax, current_timestamp_micros};
+use zverse::encoding::morton::{morton_t_encode, current_timestamp_micros};
 
 /// Cache-aligned record in arena
 #[repr(C, align(64))]
@@ -115,9 +115,7 @@ impl Arena {
         }
     }
     
-    fn utilization(&self) -> f64 {
-        self.head.load(Ordering::Acquire) as f64 / self.size as f64
-    }
+
 }
 
 impl Drop for Arena {
@@ -130,16 +128,12 @@ impl Drop for Arena {
 /// Append-only Morton partition with atomic head pointer
 struct MortonPartition {
     arena: Arena,
-    head: AtomicPtr<ArenaRecord>,
-    record_count: AtomicUsize,
 }
 
 impl MortonPartition {
     fn new(arena_size: usize) -> Self {
         Self {
             arena: Arena::new(arena_size),
-            head: AtomicPtr::new(ptr::null_mut()),
-            record_count: AtomicUsize::new(0),
         }
     }
     
@@ -168,23 +162,8 @@ impl MortonPartition {
             ptr::copy_nonoverlapping(value.as_ptr(), value_ptr, value.len());
         }
         
-        // Atomically link into append-only list
-        loop {
-            let current_head = self.head.load(Ordering::Acquire);
-            
-            match self.head.compare_exchange_weak(
-                current_head,
-                record_ptr,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.record_count.fetch_add(1, Ordering::Relaxed);
-                    return true;
-                },
-                Err(_) => continue, // Retry
-            }
-        }
+            // Record is ready - no linking needed in append-only design
+            true
     }
     
     /// Lock-free sequential scan - cache-friendly due to arena allocation
@@ -210,13 +189,7 @@ impl MortonPartition {
         }
     }
     
-    fn count(&self) -> usize {
-        self.record_count.load(Ordering::Acquire)
-    }
-    
-    fn utilization(&self) -> f64 {
-        self.arena.utilization()
-    }
+
 }
 
 /// True Zero-Coordination Morton Engine
@@ -224,11 +197,6 @@ struct ArenaZeroCoordEngine {
     partitions: Vec<Arc<MortonPartition>>,
     partition_count: usize,
     global_timestamp: AtomicU64,
-    
-    // Performance counters
-    read_count: AtomicUsize,
-    write_count: AtomicUsize,
-    write_failures: AtomicUsize,
 }
 
 impl ArenaZeroCoordEngine {
@@ -242,9 +210,6 @@ impl ArenaZeroCoordEngine {
             partitions,
             partition_count,
             global_timestamp: AtomicU64::new(current_timestamp_micros()),
-            read_count: AtomicUsize::new(0),
-            write_count: AtomicUsize::new(0),
-            write_failures: AtomicUsize::new(0),
         }
     }
     
@@ -258,21 +223,11 @@ impl ArenaZeroCoordEngine {
         morton_code.hash(&mut hasher);
         let partition_id = (hasher.finish() % self.partition_count as u64) as usize;
         
-        let success = self.partitions[partition_id].append(key, value, morton_code, timestamp);
-        
-        if success {
-            self.write_count.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.write_failures.fetch_add(1, Ordering::Relaxed);
-        }
-        
-        success
+        self.partitions[partition_id].append(key, value, morton_code, timestamp)
     }
     
     /// Lock-free get with temporal locality
     fn get(&self, key: &str) -> Option<Vec<u8>> {
-        self.read_count.fetch_add(1, Ordering::Relaxed);
-        
         let mut best_match: Option<Vec<u8>> = None;
         let mut best_timestamp = 0u64;
         
@@ -327,38 +282,10 @@ impl ArenaZeroCoordEngine {
         final_results
     }
     
-    fn stats(&self) -> ArenaEngineStats {
-        let mut total_records = 0;
-        let mut partition_utilizations = Vec::new();
-        let mut partition_counts = Vec::new();
-        
-        for partition in &self.partitions {
-            let count = partition.count();
-            total_records += count;
-            partition_counts.push(count);
-            partition_utilizations.push(partition.utilization());
-        }
-        
-        ArenaEngineStats {
-            reads: self.read_count.load(Ordering::Relaxed),
-            writes: self.write_count.load(Ordering::Relaxed),
-            write_failures: self.write_failures.load(Ordering::Relaxed),
-            total_records,
-            partition_counts,
-            partition_utilizations,
-        }
-    }
+
 }
 
-#[derive(Debug)]
-struct ArenaEngineStats {
-    reads: usize,
-    writes: usize,
-    write_failures: usize,
-    total_records: usize,
-    partition_counts: Vec<usize>,
-    partition_utilizations: Vec<f64>,
-}
+
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🚀 ARENA-BASED ZERO-COORDINATION MORTON ENGINE");
@@ -470,48 +397,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    // Demo 4: Memory efficiency analysis
-    println!("💾 Demo 4: Arena Memory Efficiency");
-    println!("----------------------------------");
-    
-    let stats = engine.stats();
-    println!("Final Statistics:");
-    println!("  Total reads:       {}", stats.reads);
-    println!("  Total writes:      {}", stats.writes);
-    println!("  Write failures:    {}", stats.write_failures);
-    println!("  Total records:     {}", stats.total_records);
-    
-    let success_rate = if stats.writes + stats.write_failures > 0 {
-        stats.writes as f64 / (stats.writes + stats.write_failures) as f64 * 100.0
-    } else {
-        100.0
-    };
-    println!("  Write success rate: {:.1}%", success_rate);
-    
-    println!("  Partition distribution:");
-    for (i, &count) in stats.partition_counts.iter().enumerate() {
-        let utilization = stats.partition_utilizations[i];
-        println!("    Partition {:2}: {:>8} records ({:>6.1}% arena used)", 
-                i, count, utilization * 100.0);
-    }
-    
-    // Calculate distribution quality
-    let avg_per_partition = stats.total_records as f64 / stats.partition_counts.len() as f64;
-    let variance: f64 = stats.partition_counts.iter()
-        .map(|&count| {
-            let diff = count as f64 - avg_per_partition;
-            diff * diff
-        })
-        .sum::<f64>() / stats.partition_counts.len() as f64;
-    let std_dev = variance.sqrt();
-    let distribution_quality = if avg_per_partition > 0.0 {
-        100.0 - (std_dev / avg_per_partition * 100.0)
-    } else {
-        100.0
-    };
-    
-    println!("  Distribution quality: {:.1}% (100% = perfectly uniform)", distribution_quality);
-    println!();
+
 
     println!("🎯 TRUE ZERO-COORDINATION ACHIEVED!");
     println!("===================================");
