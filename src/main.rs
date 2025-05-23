@@ -1,344 +1,244 @@
-use std::time::Instant;
-use std::io::{self, Write};
-use zverse::{ZVerse, ZVerseConfig, Error};
-
-/// Print a usage message
-fn print_usage() {
-    println!("ZVerse - Z-Order Curve Optimized Versioned KV Store");
-    println!("Usage:");
-    println!("  zverse [OPTIONS] COMMAND [ARGS]");
-    println!("");
-    println!("Options:");
-    println!("  --path PATH       Data directory path (default: ./zverse_data)");
-    println!("  --segment-size N  Segment size in MB (default: 16)");
-    println!("  --sync            Sync writes immediately (default: true)");
-    println!("  --cache-size N    Cache size in MB (default: 1024)");
-    println!("  --help            Show this help message");
-    println!("");
-    println!("Commands:");
-    println!("  get KEY [VERSION]           Get value for key at version (default: latest)");
-    println!("  put KEY VALUE               Put value for key");
-    println!("  delete KEY                  Delete key");
-    println!("  scan [START] [END] [VERSION] Scan range of keys at version (default: latest)");
-    println!("  history KEY [START] [END]   Get history of key from start to end version");
-    println!("  benchmark                   Run basic benchmark");
-    println!("  version                     Show version information");
-}
-
-/// Parse command line arguments
-fn parse_args() -> Result<(ZVerseConfig, String, Vec<String>), String> {
-    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
-    
-    if args.is_empty() || args.contains(&"--help".to_string()) {
-        print_usage();
-        std::process::exit(0);
-    }
-    
-    // Default configuration
-    let mut config = ZVerseConfig::default();
-    
-    // Parse options
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--path" => {
-                if i + 1 < args.len() {
-                    config.data_path = args[i + 1].clone();
-                    args.remove(i);
-                    args.remove(i);
-                } else {
-                    return Err("Missing value for --path".to_string());
-                }
-            }
-            "--segment-size" => {
-                if i + 1 < args.len() {
-                    let size = args[i + 1].parse::<usize>()
-                        .map_err(|_| "Invalid segment size".to_string())?;
-                    config.segment_size = size * 1024 * 1024;
-                    args.remove(i);
-                    args.remove(i);
-                } else {
-                    return Err("Missing value for --segment-size".to_string());
-                }
-            }
-            "--sync" => {
-                config.sync_writes = true;
-                args.remove(i);
-            }
-            "--no-sync" => {
-                config.sync_writes = false;
-                args.remove(i);
-            }
-            "--cache-size" => {
-                if i + 1 < args.len() {
-                    let size = args[i + 1].parse::<usize>()
-                        .map_err(|_| "Invalid cache size".to_string())?;
-                    config.cache_size_bytes = size * 1024 * 1024;
-                    args.remove(i);
-                    args.remove(i);
-                } else {
-                    return Err("Missing value for --cache-size".to_string());
-                }
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-    
-    if args.is_empty() {
-        return Err("Missing command".to_string());
-    }
-    
-    let command = args[0].clone();
-    let command_args = args.into_iter().skip(1).collect();
-    
-    Ok((config, command, command_args))
-}
-
-/// Handle get command
-fn handle_get(db: &ZVerse, args: &[String]) -> Result<(), Error> {
-    if args.is_empty() {
-        return Err(Error::Other("Missing key argument".to_string()));
-    }
-    
-    let key = args[0].as_bytes();
-    let version = if args.len() > 1 {
-        Some(args[1].parse::<u64>().map_err(|_| Error::Other("Invalid version".to_string()))?)
-    } else {
-        None
-    };
-    
-    match db.get::<_, Vec<u8>>(key, version)? {
-        Some(value) => {
-            println!("Value: {}", String::from_utf8_lossy(&value));
-            Ok(())
-        }
-        None => {
-            println!("Key not found");
-            Ok(())
-        }
-    }
-}
-
-/// Handle put command
-fn handle_put(db: &ZVerse, args: &[String]) -> Result<(), Error> {
-    if args.len() < 2 {
-        return Err(Error::Other("Missing key or value argument".to_string()));
-    }
-    
-    let key = args[0].as_bytes();
-    let value = args[1].as_bytes();
-    
-    let version = db.put(key, value)?;
-    println!("Put successful at version {}", version);
-    
-    Ok(())
-}
-
-/// Handle delete command
-fn handle_delete(db: &ZVerse, args: &[String]) -> Result<(), Error> {
-    if args.is_empty() {
-        return Err(Error::Other("Missing key argument".to_string()));
-    }
-    
-    let key = args[0].as_bytes();
-    
-    let version = db.delete(key)?;
-    println!("Delete successful at version {}", version);
-    
-    Ok(())
-}
-
-/// Handle scan command
-fn handle_scan(db: &ZVerse, args: &[String]) -> Result<(), Error> {
-    let start = if !args.is_empty() && args[0] != "-" {
-        Some(args[0].as_bytes())
-    } else {
-        None
-    };
-    
-    let end = if args.len() > 1 && args[1] != "-" {
-        Some(args[1].as_bytes())
-    } else {
-        None
-    };
-    
-    let version = if args.len() > 2 {
-        Some(args[2].parse::<u64>().map_err(|_| Error::Other("Invalid version".to_string()))?)
-    } else {
-        None
-    };
-    
-    let iter = db.scan(start, end, version)?;
-    let mut count = 0;
-    
-    for result in iter {
-        let (key, value) = result?;
-        println!("Key: {}, Value: {}", 
-                 String::from_utf8_lossy(&key),
-                 String::from_utf8_lossy(&value));
-        count += 1;
-    }
-    
-    println!("Total: {} records", count);
-    
-    Ok(())
-}
-
-/// Handle history command
-fn handle_history(db: &ZVerse, args: &[String]) -> Result<(), Error> {
-    if args.is_empty() {
-        return Err(Error::Other("Missing key argument".to_string()));
-    }
-    
-    let key = args[0].as_bytes();
-    
-    let start_version = if args.len() > 1 && args[1] != "-" {
-        Some(args[1].parse::<u64>().map_err(|_| Error::Other("Invalid start version".to_string()))?)
-    } else {
-        None
-    };
-    
-    let end_version = if args.len() > 2 && args[2] != "-" {
-        Some(args[2].parse::<u64>().map_err(|_| Error::Other("Invalid end version".to_string()))?)
-    } else {
-        None
-    };
-    
-    let iter = db.history(key, start_version, end_version)?;
-    let mut count = 0;
-    
-    for result in iter {
-        let (version, value) = result?;
-        println!("Version: {}, Value: {}", version, String::from_utf8_lossy(&value));
-        count += 1;
-    }
-    
-    println!("Total: {} versions", count);
-    
-    Ok(())
-}
-
-/// Handle benchmark command
-fn handle_benchmark(db: &ZVerse, _args: &[String]) -> Result<(), Error> {
-    println!("Running basic benchmark...");
-    
-    // Parameters
-    const NUM_KEYS: usize = 100_000;
-    const KEY_SIZE: usize = 16;
-    const VALUE_SIZE: usize = 100;
-    
-    // Generate random data
-    println!("Generating {} random key-value pairs...", NUM_KEYS);
-    let mut keys = Vec::with_capacity(NUM_KEYS);
-    let mut values = Vec::with_capacity(NUM_KEYS);
-    
-    for i in 0..NUM_KEYS {
-        let mut key = Vec::with_capacity(KEY_SIZE);
-        key.extend_from_slice(format!("key-{:010}", i).as_bytes());
-        keys.push(key);
-        
-        let mut value = Vec::with_capacity(VALUE_SIZE);
-        value.extend_from_slice(format!("value-{:0100}", i).as_bytes());
-        values.push(value);
-    }
-    
-    // Benchmark put
-    println!("Benchmarking put...");
-    let start = Instant::now();
-    for i in 0..NUM_KEYS {
-        db.put(&keys[i], &values[i])?;
-        
-        if (i + 1) % 10_000 == 0 {
-            print!("\r{}/{} keys written", i + 1, NUM_KEYS);
-            io::stdout().flush().unwrap();
-        }
-    }
-    let put_duration = start.elapsed();
-    println!("\nPut: {} keys in {:?} ({:.2} keys/sec)",
-             NUM_KEYS,
-             put_duration,
-             NUM_KEYS as f64 / put_duration.as_secs_f64());
-    
-    // Benchmark get
-    println!("Benchmarking get...");
-    let start = Instant::now();
-    for i in 0..NUM_KEYS {
-        db.get::<_, Vec<u8>>(&keys[i], None)?;
-        
-        if (i + 1) % 10_000 == 0 {
-            print!("\r{}/{} keys read", i + 1, NUM_KEYS);
-            io::stdout().flush().unwrap();
-        }
-    }
-    let get_duration = start.elapsed();
-    println!("\nGet: {} keys in {:?} ({:.2} keys/sec)",
-             NUM_KEYS,
-             get_duration,
-             NUM_KEYS as f64 / get_duration.as_secs_f64());
-    
-    // Benchmark scan
-    println!("Benchmarking scan...");
-    let start = Instant::now();
-    let iter = db.scan::<&[u8]>(None, None, None)?;
-    let mut count = 0;
-    for _ in iter {
-        count += 1;
-    }
-    let scan_duration = start.elapsed();
-    println!("Scan: {} keys in {:?} ({:.2} keys/sec)",
-             count,
-             scan_duration,
-             count as f64 / scan_duration.as_secs_f64());
-    
-    Ok(())
-}
-
-/// Handle version command
-fn handle_version(_db: &ZVerse, _args: &[String]) -> Result<(), Error> {
-    println!("ZVerse v{}", env!("CARGO_PKG_VERSION"));
-    println!("Z-Order Curve Optimized Versioned KV Store");
-    println!("https://github.com/surrealdb/zverse");
-    
-    Ok(())
-}
+use std::time::{Duration, Instant};
+use zverse::{ZVerseEngine, init_timestamp};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse command line arguments
-    let (config, command, args) = match parse_args() {
-        Ok(result) => result,
-        Err(err) => {
-            eprintln!("Error: {}", err);
-            print_usage();
-            std::process::exit(1);
+    // Initialize the timestamp system
+    init_timestamp();
+
+    // Create a database file on disk for demonstration (not in memory-backed /tmp)
+    let db_file = std::path::Path::new("./zverse_perf_test.db");
+
+    // Remove existing file for clean test
+    std::fs::remove_file(db_file).ok();
+
+    let engine = ZVerseEngine::open(db_file)?;
+
+    println!("ZVerse Performance Test");
+    println!("======================");
+
+    // Test 1: Bulk Insert Performance
+    println!("\n1. Bulk Insert Performance Test");
+    let insert_count = 500_000;
+    let start = Instant::now();
+
+    for i in 0..insert_count {
+        let key = format!("user:{:08}", i);
+        let value = format!(
+            "User data for user {}, created at timestamp {}",
+            i,
+            i * 1000
+        );
+        engine.put(key.as_bytes(), value.as_bytes())?;
+
+        if i % 10_000 == 0 && i > 0 {
+            let elapsed = start.elapsed();
+            let ops_per_sec = i as f64 / elapsed.as_secs_f64();
+            println!("  {} records inserted, {:.0} ops/sec", i, ops_per_sec);
         }
-    };
-    
-    // Create ZVerse instance
-    let db = ZVerse::new(config)?;
-    
-    // Dispatch command
-    let result = match command.as_str() {
-        "get" => handle_get(&db, &args),
-        "put" => handle_put(&db, &args),
-        "delete" => handle_delete(&db, &args),
-        "scan" => handle_scan(&db, &args),
-        "history" => handle_history(&db, &args),
-        "benchmark" => handle_benchmark(&db, &args),
-        "version" => handle_version(&db, &args),
-        _ => {
-            eprintln!("Unknown command: {}", command);
-            print_usage();
-            std::process::exit(1);
-        }
-    };
-    
-    // Handle errors
-    if let Err(err) = result {
-        eprintln!("Error: {}", err);
-        std::process::exit(1);
     }
-    
+
+    let insert_duration = start.elapsed();
+    let insert_ops_per_sec = insert_count as f64 / insert_duration.as_secs_f64();
+
+    println!(
+        "  ✅ Inserted {} records in {:?}",
+        insert_count, insert_duration
+    );
+    println!("  📊 Insert rate: {:.0} ops/sec", insert_ops_per_sec);
+    println!(
+        "  📊 Average insert latency: {:.2}μs",
+        insert_duration.as_micros() as f64 / insert_count as f64
+    );
+
+    // Test 2: Point Lookup Performance
+    println!("\n2. Point Lookup Performance Test");
+    let lookup_count = 10_000;
+    let mut found_count = 0;
+
+    let start = Instant::now();
+    for i in 0..lookup_count {
+        let key = format!("user:{:08}", i * 10); // Sample every 10th user
+        if engine.get(key.as_bytes())?.is_some() {
+            found_count += 1;
+        }
+    }
+    let lookup_duration = start.elapsed();
+    let lookup_ops_per_sec = lookup_count as f64 / lookup_duration.as_secs_f64();
+
+    println!(
+        "  ✅ Performed {} lookups in {:?}",
+        lookup_count, lookup_duration
+    );
+    println!("  📊 Found {} records", found_count);
+    println!("  📊 Lookup rate: {:.0} ops/sec", lookup_ops_per_sec);
+    println!(
+        "  📊 Average lookup latency: {:.2}μs",
+        lookup_duration.as_micros() as f64 / lookup_count as f64
+    );
+
+    // Test 3: Range Scan Performance
+    println!("\n3. Range Scan Performance Test");
+    let start = Instant::now();
+
+    let range_results = engine.range(b"user:00010000", b"user:00020000")?;
+    let range_duration = start.elapsed();
+
+    println!("  ✅ Range scan completed in {:?}", range_duration);
+    println!("  📊 Found {} records in range", range_results.len());
+    println!(
+        "  📊 Scan rate: {:.0} records/sec",
+        range_results.len() as f64 / range_duration.as_secs_f64()
+    );
+
+    // Test 4: Update Performance (COW semantics)
+    println!("\n4. Update Performance Test (COW)");
+    let update_count = 1_000;
+    let start = Instant::now();
+
+    for i in 0..update_count {
+        let key = format!("user:{:08}", i);
+        let value = format!(
+            "UPDATED: User data for user {}, updated at {}",
+            i,
+            start.elapsed().as_micros()
+        );
+        engine.put(key.as_bytes(), value.as_bytes())?;
+    }
+
+    let update_duration = start.elapsed();
+    let update_ops_per_sec = update_count as f64 / update_duration.as_secs_f64();
+
+    println!(
+        "  ✅ Updated {} records in {:?}",
+        update_count, update_duration
+    );
+    println!("  📊 Update rate: {:.0} ops/sec", update_ops_per_sec);
+
+    // Test 5: Version History Performance
+    println!("\n5. Version History Test");
+    let start = Instant::now();
+
+    let versions = engine.get_versions(b"user:00000001")?;
+    let version_duration = start.elapsed();
+
+    println!("  ✅ Retrieved version history in {:?}", version_duration);
+    println!("  📊 Found {} versions for user:00000001", versions.len());
+    for (i, (timestamp, _)) in versions.iter().enumerate() {
+        if i < 3 {
+            println!("    Version {}: timestamp {}", i + 1, timestamp);
+        }
+    }
+    if versions.len() > 3 {
+        println!("    ... and {} more versions", versions.len() - 3);
+    }
+
+    // Test 6: Mixed Workload Performance
+    println!("\n6. Mixed Workload Test");
+    let mixed_ops = 5_000;
+    let start = Instant::now();
+
+    for i in 0..mixed_ops {
+        match i % 3 {
+            0 => {
+                // Write operation (33%)
+                let key = format!("mixed:{:08}", i);
+                let value = format!("Mixed workload data {}", i);
+                engine.put(key.as_bytes(), value.as_bytes())?;
+            }
+            1 => {
+                // Read operation (33%)
+                let key = format!("user:{:08}", i % 10000);
+                engine.get(key.as_bytes())?;
+            }
+            2 => {
+                // Range operation (33%)
+                let start_key = format!("user:{:08}", i % 1000);
+                let end_key = format!("user:{:08}", (i % 1000) + 100);
+                engine.range(start_key.as_bytes(), end_key.as_bytes())?;
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    let mixed_duration = start.elapsed();
+    let mixed_ops_per_sec = mixed_ops as f64 / mixed_duration.as_secs_f64();
+
+    println!(
+        "  ✅ Completed {} mixed operations in {:?}",
+        mixed_ops, mixed_duration
+    );
+    println!("  📊 Mixed workload rate: {:.0} ops/sec", mixed_ops_per_sec);
+
+    // Test 7: Temporal Locality Test
+    println!("\n7. Temporal Locality Test");
+    let start = Instant::now();
+
+    // Insert data with clustered timestamps
+    for batch in 0..10 {
+        let batch_start = Instant::now();
+        for i in 0..100 {
+            let key = format!("temporal:{}:{:04}", batch, i);
+            let value = format!("Batch {} item {}", batch, i);
+            engine.put(key.as_bytes(), value.as_bytes())?;
+        }
+
+        // Small delay to create temporal clustering
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let temporal_duration = start.elapsed();
+    println!("  ✅ Created temporal clusters in {:?}", temporal_duration);
+
+    // Now test sequential access of one batch
+    let batch_start = Instant::now();
+    let mut batch_results = Vec::new();
+    for i in 0..100 {
+        let key = format!("temporal:5:{:04}", i);
+        if let Some(value) = engine.get(key.as_bytes())? {
+            batch_results.push(value);
+        }
+    }
+    let batch_duration = batch_start.elapsed();
+
+    println!(
+        "  📊 Sequential batch access: {} items in {:?}",
+        batch_results.len(),
+        batch_duration
+    );
+    println!(
+        "  📊 Batch access rate: {:.0} items/sec",
+        batch_results.len() as f64 / batch_duration.as_secs_f64()
+    );
+
+    // Database Statistics
+    println!("\n8. Database Statistics");
+    let stats = engine.stats();
+    println!("  📊 Total unique keys: {}", stats.total_keys);
+    println!(
+        "  📊 File size: {:.2} MB",
+        stats.file_size_bytes as f64 / 1_048_576.0
+    );
+    println!(
+        "  📊 Average bytes per key: {:.1}",
+        stats.file_size_bytes as f64 / stats.total_keys as f64
+    );
+
+    // Cleanup and final timing
+    engine.flush()?;
+
+    println!("\n🎉 Performance Test Completed Successfully!");
+    println!("\n📈 Summary:");
+    println!("  • Bulk Insert: {:.0} ops/sec", insert_ops_per_sec);
+    println!("  • Point Lookup: {:.0} ops/sec", lookup_ops_per_sec);
+    println!("  • Mixed Workload: {:.0} ops/sec", mixed_ops_per_sec);
+    println!(
+        "  • Database Size: {:.2} MB",
+        stats.file_size_bytes as f64 / 1_048_576.0
+    );
+
+    // Keep the test file for inspection
+    println!("\n💾 Database file saved as: {}", db_file.display());
+    println!("   You can inspect it or run the test again to see performance on existing data.");
+
     Ok(())
 }
