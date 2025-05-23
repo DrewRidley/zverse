@@ -7,6 +7,7 @@
 
 /// Core data structures shared across implementations
 pub mod core;
+pub mod zcurve_db;
 
 /// In-memory implementation for development and testing
 pub mod inmemory;
@@ -45,6 +46,7 @@ pub use error::Error;
 pub use inmemory::InMemoryZVerse;
 pub use mmap_storage::MmapStorageManager;
 pub use persistent_zverse::PersistentZVerse;
+pub use zcurve_db::{ZCurveDB, Error as ZCurveError, DBStats};
 pub use lockfree_zverse::LockFreeZVerseKV;
 pub use master_class::{MasterClassZVerse, MasterClassConfig, SyncStrategy};
 
