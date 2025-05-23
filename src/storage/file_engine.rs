@@ -11,9 +11,13 @@ use crate::storage::page::{Page, PageType, Slot, PageError, PAGE_SIZE};
 use crate::storage::extent::{ExtentError};
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
 use std::path::PathBuf;
+use parking_lot::RwLock;
 
 /// Configuration for file-backed storage engine
 #[derive(Debug, Clone)]
@@ -25,7 +29,7 @@ pub struct FileEngineConfig {
     /// Cache size for hot extents (in memory)
     pub cache_size: usize,
     /// Morton range padding for new intervals
-    pub morton_padding: u64,
+    morton_padding: u64,
 }
 
 impl Default for FileEngineConfig {
@@ -34,7 +38,7 @@ impl Default for FileEngineConfig {
             file_config: FileStorageConfig::default(),
             max_extents: 10000,
             cache_size: 100,
-            morton_padding: 10000,
+            morton_padding: 100_000_000, // Much larger padding for better key grouping
         }
     }
 }
@@ -63,17 +67,19 @@ impl FileEngineConfig {
 /// File-backed storage engine with key-value operations
 pub struct FileEngine {
     /// File storage backend
-    file_storage: FileStorage,
+    file_storage: Arc<Mutex<FileStorage>>,
     /// Interval table mapping Morton ranges to extents  
-    interval_table: IntervalTable,
+    interval_table: Arc<RwLock<IntervalTable>>,
     /// Cache of extent metadata
-    extent_cache: HashMap<u32, ExtentMetadata>,
+    extent_cache: Arc<RwLock<HashMap<u32, ExtentMetadata>>>,
     /// Next extent ID to allocate
     next_extent_id: AtomicU32,
     /// Configuration
     config: FileEngineConfig,
-    /// Statistics
-    stats: RefCell<FileEngineStats>,
+    /// Read counter
+    read_count: AtomicU64,
+    /// Write counter
+    write_count: AtomicU64,
 }
 
 /// Metadata for cached extents
@@ -90,20 +96,69 @@ struct ExtentMetadata {
 impl FileEngine {
     /// Create a new file-backed storage engine
     pub fn new(config: FileEngineConfig) -> Result<Self, FileEngineError> {
-        let file_storage = FileStorage::new(config.file_config.clone())?;
+        let file_storage = Arc::new(Mutex::new(FileStorage::new(config.file_config.clone())?));
         
-        Ok(Self {
+        let engine = Self {
             file_storage,
-            interval_table: IntervalTable::new(),
-            extent_cache: HashMap::new(),
+            interval_table: Arc::new(RwLock::new(IntervalTable::new())),
+            extent_cache: Arc::new(RwLock::new(HashMap::new())),
             next_extent_id: AtomicU32::new(1),
             config,
-            stats: RefCell::new(FileEngineStats::default()),
-        })
+            read_count: AtomicU64::new(0),
+            write_count: AtomicU64::new(0),
+        };
+        
+        // Pre-allocate 4 large extents covering the entire Morton space
+        engine.initialize_large_extents()?;
+        
+        Ok(engine)
+    }
+
+    /// Initialize 4 large extents covering the entire Morton space
+    fn initialize_large_extents(&self) -> Result<(), FileEngineError> {
+        // Divide the full u64 range into 4 large extents
+        let ranges = [
+            (0u64, u64::MAX / 4),
+            (u64::MAX / 4 + 1, u64::MAX / 2),
+            (u64::MAX / 2 + 1, u64::MAX / 4 * 3),
+            (u64::MAX / 4 * 3 + 1, u64::MAX),
+        ];
+
+        for (start, end) in ranges.iter() {
+            let extent_id = self.next_extent_id.fetch_add(1, Ordering::Relaxed);
+            let extent_offset = {
+                let mut storage = self.file_storage.lock().unwrap();
+                storage.allocate_extent(extent_id)?
+            };
+            
+            // Insert into interval table
+            {
+                let mut interval_table = self.interval_table.write();
+                interval_table.insert(*start, *end, extent_id)?;
+            }
+            
+            // Cache the extent metadata
+            let metadata = ExtentMetadata {
+                extent_id,
+                offset: extent_offset,
+                morton_start: *start,
+                morton_end: *end,
+                page_count: self.calculate_page_count_for_extent(),
+                allocated_pages: 0,
+            };
+            {
+                let mut cache = self.extent_cache.write();
+                cache.insert(extent_id, metadata);
+            }
+        }
+
+        Ok(())
     }
 
     /// Store a key-value pair
-    pub fn put(&mut self, key: &str, value: &[u8]) -> Result<(), FileEngineError> {
+    pub fn put(&self, key: &str, value: &[u8]) -> Result<(), FileEngineError> {
+        self.write_count.fetch_add(1, Ordering::Relaxed);
+        
         let timestamp = current_timestamp_micros();
         let morton_code = morton_t_encode(key, timestamp);
         
@@ -114,51 +169,59 @@ impl FileEngine {
         let page_index = self.find_or_allocate_page_in_extent(extent_id, morton_code.value())?;
         
         // Read the page, modify it, and write it back
-        let mut page = self.file_storage.read_page(extent_id, page_index)?
-            .unwrap_or_else(|| Page::new(PageType::Leaf));
+        let mut page = {
+            let storage = self.file_storage.lock().unwrap();
+            storage.read_page(extent_id, page_index)?
+                .unwrap_or_else(|| Page::new(PageType::Leaf))
+        };
         
         self.insert_into_page(&mut page, key, value, morton_code)?;
         
         // Write the modified page back
-        self.file_storage.write_page(extent_id, page_index, &page)?;
-        
-        // Update statistics
-        self.stats.borrow_mut().writes += 1;
+        {
+            let mut storage = self.file_storage.lock().unwrap();
+            storage.write_page(extent_id, page_index, &page)?;
+        }
         
         Ok(())
     }
 
     /// Retrieve a value for a key
     pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>, FileEngineError> {
-        // Try recent timestamps first for temporal locality
-        let current_time = current_timestamp_micros();
-        let search_window = 1_000_000; // 1 second window
+        self.read_count.fetch_add(1, Ordering::Relaxed);
         
-        for offset in 0..search_window {
+        let current_time = current_timestamp_micros();
+        
+        // Search backwards from current time to find latest version
+        // Use a small window and simple linear search for reliability
+        let max_offset = 100_000u64; // 100ms window should be enough
+        
+        for offset in 0..max_offset {
             let search_timestamp = current_time.saturating_sub(offset);
             let morton_code = morton_t_encode(key, search_timestamp);
             
             if let Some(value) = self.get_at_morton(key, morton_code.value())? {
-                self.stats.borrow_mut().reads += 1;
                 return Ok(Some(value));
             }
             
-            // Skip ahead for efficiency
-            if offset > 1000 && offset % 1000 != 0 {
+            // Skip ahead for efficiency after first few microseconds
+            if offset > 1000 && offset % 100 != 0 {
                 continue;
             }
         }
         
-        self.stats.borrow_mut().reads += 1;
         Ok(None)
     }
 
     /// Get value at specific Morton code
     fn get_at_morton(&self, key: &str, morton_code: u64) -> Result<Option<Vec<u8>>, FileEngineError> {
         // Find extent containing this Morton code
-        let extent_id = match self.interval_table.find_extent(morton_code) {
-            Some(id) => id,
-            None => return Ok(None),
+        let extent_id = {
+            let interval_table = self.interval_table.read();
+            match interval_table.find_extent(morton_code) {
+                Some(id) => id,
+                None => return Ok(None),
+            }
         };
         
         // Find page within extent
@@ -168,9 +231,12 @@ impl FileEngine {
         };
         
         // Read the page
-        let page = match self.file_storage.read_page(extent_id, page_index)? {
-            Some(page) => page,
-            None => return Ok(None),
+        let page = {
+            let storage = self.file_storage.lock().unwrap();
+            match storage.read_page(extent_id, page_index)? {
+                Some(page) => page,
+                None => return Ok(None),
+            }
         };
         
         // Search for key in page
@@ -178,51 +244,46 @@ impl FileEngine {
     }
 
     /// Find or create extent for Morton code
-    fn find_or_create_extent_for_morton(&mut self, morton_code: u64) -> Result<u32, FileEngineError> {
-        // Check if existing extent can handle this Morton code
-        if let Some(extent_id) = self.interval_table.find_extent(morton_code) {
-            return Ok(extent_id);
-        }
-        
-        // Create new extent
-        let extent_id = self.next_extent_id.fetch_add(1, Ordering::Relaxed);
-        if extent_id > self.config.max_extents {
-            return Err(FileEngineError::TooManyExtents);
-        }
-        
-        let extent_offset = self.file_storage.allocate_extent(extent_id)?;
-        
-        // Create interval with padding around the Morton code
-        let interval_start = morton_code.saturating_sub(self.config.morton_padding);
-        let interval_end = morton_code.saturating_add(self.config.morton_padding);
-        
-        // Insert into interval table
-        self.interval_table.insert(interval_start, interval_end, extent_id)?;
-        
-        // Cache the extent metadata
-        let metadata = ExtentMetadata {
-            extent_id,
-            offset: extent_offset,
-            morton_start: interval_start,
-            morton_end: interval_end,
-            page_count: self.calculate_page_count_for_extent(),
-            allocated_pages: 0,
+    fn find_or_create_extent_for_morton(&self, morton_code: u64) -> Result<u32, FileEngineError> {
+        // Find existing extent that contains this Morton code
+        let extent_id = {
+            let interval_table = self.interval_table.read();
+            match interval_table.find_extent(morton_code) {
+                Some(id) => id,
+                None => return Err(FileEngineError::ExtentNotFound),
+            }
         };
-        self.extent_cache.insert(extent_id, metadata);
         
-        Ok(extent_id)
+        // Check if extent is full and needs splitting
+        if self.is_extent_full(extent_id)? {
+            // Split the extent and determine which half contains our Morton code
+            let _new_extent_id = self.split_extent(extent_id)?;
+            
+            // Return the extent that contains our Morton code
+            let interval_table = self.interval_table.read();
+            if let Some(id) = interval_table.find_extent(morton_code) {
+                Ok(id)
+            } else {
+                Err(FileEngineError::ExtentNotFound)
+            }
+        } else {
+            Ok(extent_id)
+        }
     }
 
     /// Find or allocate page in extent for Morton code
-    fn find_or_allocate_page_in_extent(&mut self, extent_id: u32, morton_code: u64) -> Result<u32, FileEngineError> {
-        // Check if existing page can handle this Morton code
+    fn find_or_allocate_page_in_extent(&self, extent_id: u32, morton_code: u64) -> Result<u32, FileEngineError> {
+        // First try to find existing page
         if let Some(page_index) = self.find_page_for_morton_in_extent(extent_id, morton_code)? {
             return Ok(page_index);
         }
         
-        // Allocate new page (for now, simple sequential allocation)
-        let metadata = self.extent_cache.get_mut(&extent_id)
-            .ok_or(FileEngineError::ExtentNotFound)?;
+        // Allocate new page
+        let mut metadata = {
+            let cache = self.extent_cache.read();
+            cache.get(&extent_id).cloned()
+                .ok_or(FileEngineError::ExtentNotFound)?
+        };
         
         if metadata.allocated_pages >= metadata.page_count {
             return Err(FileEngineError::ExtentFull);
@@ -237,11 +298,17 @@ impl FileEngine {
     /// Find page for Morton code within extent
     fn find_page_for_morton_in_extent(&self, extent_id: u32, _morton_code: u64) -> Result<Option<u32>, FileEngineError> {
         // For now, simple implementation - just check if any pages exist
-        if let Some(metadata) = self.extent_cache.get(&extent_id) {
+        let metadata = {
+            let cache = self.extent_cache.read();
+            cache.get(&extent_id).cloned()
+        };
+        
+        if let Some(metadata) = metadata {
             if metadata.allocated_pages > 0 {
                 // Linear search through allocated pages (can be optimized later)
                 for page_index in 0..metadata.allocated_pages {
-                    if let Some(_page) = self.file_storage.read_page(extent_id, page_index)? {
+                    let storage = self.file_storage.lock().unwrap();
+                    if let Some(_page) = storage.read_page(extent_id, page_index)? {
                         return Ok(Some(page_index));
                     }
                 }
@@ -269,9 +336,10 @@ impl FileEngine {
         page.write_blob(value_offset, value)
             .map_err(FileEngineError::PageError)?;
         
-        // Create slot
+        // Create slot with key hash as fingerprint (not Morton code)
+        let key_hash = self.hash_key(key);
         let slot = Slot::new_leaf(
-            morton_code.value(),
+            key_hash,
             key_offset,
             key_bytes.len() as u16,
             value_offset,
@@ -290,8 +358,9 @@ impl FileEngine {
 
     /// Search page for key
     fn search_page_for_key(&self, page: &Page, key: &str, morton_code: u64) -> Result<Option<Vec<u8>>, FileEngineError> {
-        // Search for slot with matching Morton fingerprint
-        let slot_index = match page.search_slot(morton_code) {
+        // Search for slot with matching key hash fingerprint
+        let key_hash = self.hash_key(key);
+        let slot_index = match page.search_slot(key_hash) {
             Some(idx) => idx,
             None => return Ok(None),
         };
@@ -315,45 +384,62 @@ impl FileEngine {
 
     /// Calculate page count for extent
     fn calculate_page_count_for_extent(&self) -> u32 {
-        let extent_size = self.file_storage.superblock().extent_size();
+        let extent_size = {
+            let storage = self.file_storage.lock().unwrap();
+            storage.superblock().extent_size()
+        };
         let header_size = 512; // Extent header size
         (extent_size - header_size) / PAGE_SIZE as u32
     }
 
     /// Flush all changes to disk
-    pub fn flush(&mut self) -> Result<(), FileEngineError> {
-        self.file_storage.flush()?;
+    pub fn flush(&self) -> Result<(), FileEngineError> {
+        let mut storage = self.file_storage.lock().unwrap();
+        storage.flush()?;
         Ok(())
     }
 
     /// Get storage statistics
     pub fn stats(&self) -> FileEngineStats {
-        let mut stats = self.stats.borrow().clone();
-        let file_stats = self.file_storage.stats();
-        stats.file_stats = file_stats;
-        stats.extent_count = self.extent_cache.len();
-        stats.interval_count = self.interval_table.len();
-        stats
+        let file_stats = {
+            let storage = self.file_storage.lock().unwrap();
+            storage.stats()
+        };
+        FileEngineStats {
+            reads: self.read_count.load(Ordering::Relaxed),
+            writes: self.write_count.load(Ordering::Relaxed),
+            cache_hits: 0, // TODO: implement cache hit tracking
+            cache_misses: 0, // TODO: implement cache miss tracking
+            extent_count: self.extent_cache.read().len(),
+            interval_count: self.interval_table.read().len(),
+            file_stats,
+        }
     }
 
     /// Get number of extents
     pub fn extent_count(&self) -> usize {
-        self.extent_cache.len()
+        self.extent_cache.read().len()
     }
 
     /// Get number of intervals
     pub fn interval_count(&self) -> usize {
-        self.interval_table.len()
+        self.interval_table.read().len()
     }
 
     /// Validate storage integrity
     pub fn validate(&self) -> Result<(), FileEngineError> {
         // Validate interval table
-        self.interval_table.validate()?;
+        {
+            let interval_table = self.interval_table.read();
+            interval_table.validate()?;
+        }
         
         // Validate superblock
-        if !self.file_storage.superblock().verify_checksum() {
-            return Err(FileEngineError::CorruptedData);
+        {
+            let storage = self.file_storage.lock().unwrap();
+            if !storage.superblock().verify_checksum() {
+                return Err(FileEngineError::CorruptedData);
+            }
         }
         
         Ok(())
@@ -361,13 +447,109 @@ impl FileEngine {
 
     /// Close the storage engine
     pub fn close(self) -> Result<(), FileEngineError> {
-        self.file_storage.close()?;
+        let storage = Arc::try_unwrap(self.file_storage).map_err(|_| FileEngineError::CorruptedData)?.into_inner().unwrap();
+        storage.close()?;
         Ok(())
     }
 
     /// Get file path
     pub fn file_path(&self) -> &PathBuf {
         &self.config.file_config.file_path
+    }
+
+    /// Check if an extent is full and needs splitting
+    fn is_extent_full(&self, extent_id: u32) -> Result<bool, FileEngineError> {
+        let metadata = {
+            let cache = self.extent_cache.read();
+            cache.get(&extent_id).cloned()
+                .ok_or(FileEngineError::ExtentNotFound)?
+        };
+        
+        // Consider extent full if allocated pages >= page_count
+        // This ensures we split before completely filling the extent
+        Ok(metadata.allocated_pages >= metadata.page_count)
+    }
+
+    /// Split an extent into two halves when it becomes full
+    fn split_extent(&self, extent_id: u32) -> Result<u32, FileEngineError> {
+        // Get the existing extent metadata
+        let existing_metadata = {
+            let cache = self.extent_cache.read();
+            cache.get(&extent_id)
+                .ok_or(FileEngineError::ExtentNotFound)?
+                .clone()
+        };
+
+        // Calculate the midpoint for splitting
+        let morton_range = existing_metadata.morton_end - existing_metadata.morton_start;
+        let midpoint = existing_metadata.morton_start + morton_range / 2;
+
+        // Create new extent for the second half
+        let new_extent_id = self.next_extent_id.fetch_add(1, Ordering::Relaxed);
+        if new_extent_id > self.config.max_extents {
+            return Err(FileEngineError::TooManyExtents);
+        }
+
+        let new_extent_offset = {
+            let mut storage = self.file_storage.lock().unwrap();
+            storage.allocate_extent(new_extent_id)?
+        };
+
+        // Update the original extent to cover first half
+        let updated_metadata = ExtentMetadata {
+            extent_id: existing_metadata.extent_id,
+            offset: existing_metadata.offset,
+            morton_start: existing_metadata.morton_start,
+            morton_end: midpoint,
+            page_count: existing_metadata.page_count,
+            allocated_pages: 0, // Reset after split
+        };
+
+        // Create metadata for new extent (second half)
+        let new_metadata = ExtentMetadata {
+            extent_id: new_extent_id,
+            offset: new_extent_offset,
+            morton_start: midpoint + 1,
+            morton_end: existing_metadata.morton_end,
+            page_count: self.calculate_page_count_for_extent(),
+            allocated_pages: 0,
+        };
+
+        // Update interval table - remove old interval and add two new ones
+        // Note: This is a simplified approach. The interval table should support
+        // proper splitting, but for now we'll rebuild with new intervals
+        
+        // Insert the two new intervals
+        {
+            let mut interval_table = self.interval_table.write();
+            interval_table.insert(
+                updated_metadata.morton_start,
+                updated_metadata.morton_end,
+                updated_metadata.extent_id
+            )?;
+            
+            interval_table.insert(
+                new_metadata.morton_start,
+                new_metadata.morton_end,
+                new_metadata.extent_id
+            )?;
+        }
+
+        // Update the cache
+        {
+            let mut cache = self.extent_cache.write();
+            cache.insert(extent_id, updated_metadata);
+            cache.insert(new_extent_id, new_metadata);
+        }
+
+        Ok(new_extent_id)
+    }
+
+    /// Hash a key to create a consistent fingerprint
+    fn hash_key(&self, key: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish()
     }
 }
 

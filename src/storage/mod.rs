@@ -8,6 +8,10 @@ pub mod extent;
 pub mod engine;
 pub mod file;
 pub mod file_engine;
+pub mod lockfree_engine;
+pub mod temporal_engine;
+pub mod transaction;
+pub mod transactional_engine;
 
 // Re-export key types and functions
 pub use page::{
@@ -51,6 +55,41 @@ pub use file_engine::{
     FileEngineConfig,
     FileEngineStats,
     FileEngineError,
+};
+
+pub use lockfree_engine::{
+    LockFreeEngine,
+    LockFreeEngineConfig,
+    LockFreeEngineStats,
+    LockFreeEngineError,
+};
+
+pub use temporal_engine::{
+    TemporalEngine,
+    TemporalEngineConfig,
+    TemporalEngineStats,
+    TemporalEngineError,
+    TemporalRecord,
+};
+
+pub use transaction::{
+    TransactionManager,
+    Transaction,
+    TransactionId,
+    SnapshotId,
+    TransactionState,
+    TransactionError,
+    TransactionStats,
+    Version,
+    VersionChain,
+};
+
+pub use transactional_engine::{
+    TransactionalEngine,
+    TransactionalEngineConfig,
+    TransactionalEngineError,
+    TransactionalEngineStats,
+    TransactionHandle,
 };
 
 #[cfg(test)]
