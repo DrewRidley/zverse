@@ -289,31 +289,42 @@ impl ArenaZeroCoordEngine {
         best_match
     }
     
-    /// Ultra-fast range query using Morton properties
+    /// Ultra-fast range query with proper temporal versioning
     fn range_query(&self, key_start: &str, key_end: &str) -> Vec<(String, Vec<u8>)> {
-        let start_morton = morton_t_bigmin(key_start).value();
-        let end_morton = morton_t_litmax(key_end).value();
+        let mut results_with_timestamps = Vec::new();
         
-        let mut results = Vec::new();
-        
-        // Scan all partitions in parallel (lock-free!)
+        // Scan all partitions - no Morton filtering to avoid timestamp issues
         for partition in &self.partitions {
             partition.scan(|record| {
                 let key = record.key();
-                if record.morton_code >= start_morton 
-                    && record.morton_code <= end_morton
-                    && key >= key_start 
-                    && key <= key_end {
-                    results.push((key.to_string(), record.value().to_vec()));
+                // Only filter by key range, not Morton codes
+                if key >= key_start && key <= key_end {
+                    results_with_timestamps.push((
+                        key.to_string(), 
+                        record.value().to_vec(),
+                        record.timestamp
+                    ));
                 }
             });
         }
         
-        // Sort and deduplicate by keeping latest version
-        results.sort_by(|a, b| a.0.cmp(&b.0));
-        results.dedup_by(|a, b| a.0 == b.0);
+        // Sort by key, then by timestamp descending (latest first)
+        results_with_timestamps.sort_by(|a, b| {
+            a.0.cmp(&b.0).then(b.2.cmp(&a.2))  // key asc, timestamp desc
+        });
         
-        results
+        // Deduplicate by key, keeping first (latest timestamp due to sort)
+        let mut final_results = Vec::new();
+        let mut last_key: Option<String> = None;
+        
+        for (key, value, _timestamp) in results_with_timestamps {
+            if last_key.as_ref() != Some(&key) {
+                final_results.push((key.clone(), value));
+                last_key = Some(key);
+            }
+        }
+        
+        final_results
     }
     
     fn stats(&self) -> ArenaEngineStats {
