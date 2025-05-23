@@ -1,0 +1,60 @@
+[package]
+name = "zverse"
+version = "0.1.0"
+edition = "2024"
+description = "Z-Order Curve Optimized Versioned KV Store"
+authors = ["SurrealDB Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/surrealdb/zverse"
+readme = "README.md"
+keywords = ["database", "kv", "z-order", "versioned"]
+categories = ["database-implementations", "data-structures"]
+
+[dependencies]
+# Core functionality
+bumpalo = "3.15.0"          # Arena allocator
+bitvec = "1.0.1"            # Bit manipulation for Z-order curve operations
+ahash = "0.8.7"             # Fast hashing
+memmap2 = "0.9.0"           # Memory mapping for large datasets
+parking_lot = "0.12.1"      # Efficient synchronization primitives
+chrono = "0.4.26"           # Date and time utilities
+
+# Optional features
+serde = { version = "1.0.196", features = ["derive"], optional = true }
+rayon = { version = "1.8.1", optional = true }      # Parallel processing
+
+[dev-dependencies]
+criterion = "0.5.1"         # Benchmarking
+rand = "0.8.5"              # Random data generation for tests
+quickcheck = "1.0.3"        # Property-based testing
+tempfile = "3.10.0"         # Temporary files for tests
+
+[features]
+default = []
+serialization = ["serde"]
+parallel = ["rayon"]
+simd = []                   # Will be implemented with target_feature detection
+
+[lib]
+name = "zverse"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zverse"
+path = "src/main.rs"
+
+[[bench]]
+name = "benchmarks"
+harness = false
+
+[[example]]
+name = "simple"
+path = "examples/simple.rs"
+
+[[example]]
+name = "persistent"
+path = "examples/persistent.rs"
+
+[[example]]
+name = "mmap_test"
+path = "examples/mmap_test.rs"
