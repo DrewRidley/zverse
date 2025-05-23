@@ -48,6 +48,10 @@ path = "src/main.rs"
 name = "benchmarks"
 harness = false
 
+[[bench]]
+name = "master_class_bench"
+harness = false
+
 [[example]]
 name = "simple"
 path = "examples/simple.rs"
