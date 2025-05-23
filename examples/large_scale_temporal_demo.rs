@@ -33,13 +33,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut config = TemporalEngineConfig::default()
         .with_path(db_path.clone())
-        .with_file_size(25 * 1024 * 1024 * 1024) // 25GB file
+        .with_file_size(40 * 1024 * 1024 * 1024) // 25GB file
         .with_extent_size(64 * 1024); // 64KB extents for fast range queries
-    config.initial_extent_count = 10000; // Many small extents for better performance
+    config.initial_extent_count = 64; // Start with reasonable number, will grow as needed
 
     println!("\n📁 Database Configuration:");
     println!("  Path: {}", db_path.display());
-    println!("  File size: 25GB");
+    println!("  File size: 40GB");
     println!("  Extent size: 64KB");
     println!("  Initial extents: {}", config.initial_extent_count);
 
@@ -100,9 +100,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Phase 3: Generate sensor data time series (100M readings)
-    println!("\n3️⃣ Phase 3: Sensor Time Series (Target: 100M readings)");
+    println!("\n3️⃣ Phase 3: Sensor Time Series (Target: 50M readings)");
     let sensor_gen_start = Instant::now();
-    generate_sensor_data(&engine, 100_000_000, &total_records, &total_bytes, &errors)?;
+    generate_sensor_data(&engine, 50_000_000, &total_records, &total_bytes, &errors)?;
     let sensor_gen_time = sensor_gen_start.elapsed();
 
     let sensor_records = total_records.load(Ordering::Relaxed) - current_records - tx_records;
@@ -247,7 +247,7 @@ fn generate_user_profiles(
 
             // Generate realistic user profile
             let profile = generate_user_profile(&mut rng, user_id);
-            let value = serde_json::to_vec(&profile)?;
+            let value = bincode::serialize(&profile)?;
 
             // Add temporal versioning (some users get updated)
             let timestamp = start_time + (rng.r#gen::<u64>() % 86400000000); // Within 24 hours
@@ -299,7 +299,7 @@ fn generate_transaction_logs(
 
             // Generate transaction record
             let transaction = generate_transaction(&mut rng, tx_id);
-            let value = serde_json::to_vec(&transaction)?;
+            let value = bincode::serialize(&transaction)?;
 
             match engine.put(&key, &value) {
                 Ok(_) => {
@@ -349,7 +349,7 @@ fn generate_sensor_data(
 
             // Generate sensor reading
             let reading = generate_sensor_reading(&mut rng, sensor_id, reading_id);
-            let value = serde_json::to_vec(&reading)?;
+            let value = bincode::serialize(&reading)?;
 
             match engine.put(&key, &value) {
                 Ok(_) => {

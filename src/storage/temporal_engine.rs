@@ -13,9 +13,10 @@ use crate::storage::file::{FileStorage, FileStorageConfig, FileStorageError};
 use crate::storage::page::{Page, PageError, PAGE_SIZE};
 use crate::interval::table::IntervalTable;
 use crate::encoding::morton::{morton_t_encode, current_timestamp_micros, morton_t_bigmin, morton_t_litmax, morton_t_key_temporal_range};
+use serde::{Serialize, Deserialize};
 
 /// Temporal record with Morton interval validity
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemporalRecord {
     /// Start of Morton interval (inclusive)
     pub morton_start: u64,
@@ -64,6 +65,8 @@ pub struct TemporalEngineConfig {
     pub file_config: FileStorageConfig,
     pub initial_extent_count: u32,
     pub max_extents: u32,
+    pub extent_pool_size: u32,  // Number of pre-allocated extents to maintain
+    pub extent_allocation_batch: u32,  // How many extents to allocate at once
 }
 
 impl Default for TemporalEngineConfig {
@@ -72,6 +75,8 @@ impl Default for TemporalEngineConfig {
             file_config: FileStorageConfig::default(),
             initial_extent_count: 16,
             max_extents: 65536,
+            extent_pool_size: 32,  // Keep 32 pre-allocated extents
+            extent_allocation_batch: 16,  // Allocate 16 at a time (amortized)
         }
     }
 }
@@ -114,6 +119,8 @@ pub struct TemporalEngine {
     extent_cache: Arc<RwLock<HashMap<u32, TemporalExtentMetadata>>>,
     /// In-memory record cache for active intervals
     active_records: Arc<RwLock<HashMap<String, TemporalRecord>>>,
+    /// Pool of pre-allocated empty extents (amortized allocation)
+    extent_pool: Arc<RwLock<Vec<u32>>>,
     /// Next extent ID
     next_extent_id: AtomicU32,
     /// Configuration
@@ -134,6 +141,7 @@ impl TemporalEngine {
             interval_table: Arc::new(RwLock::new(IntervalTable::new())),
             extent_cache: Arc::new(RwLock::new(HashMap::new())),
             active_records: Arc::new(RwLock::new(HashMap::new())),
+            extent_pool: Arc::new(RwLock::new(Vec::new())),
             next_extent_id: AtomicU32::new(1),
             config,
             read_count: AtomicU64::new(0),
@@ -281,14 +289,10 @@ impl TemporalEngine {
 
     /// Persist a temporal record to storage
     fn persist_record(&self, record: TemporalRecord) -> Result<(), TemporalEngineError> {
-        // Find extent for this Morton interval
-        let extent_id = {
-            let interval_table = self.interval_table.read();
-            interval_table.find_extent(record.morton_start)
-                .ok_or(TemporalEngineError::ExtentNotFound)?
-        };
+        // Find extent for this Morton interval, allocate if needed
+        let extent_id = self.find_or_allocate_extent_for_morton(record.morton_start)?;
         
-        // Serialize and write record
+        // Serialize and write record using bincode
         let serialized = self.serialize_record(&record)?;
         self.write_record_to_extent(extent_id, &serialized)?;
         
@@ -430,17 +434,124 @@ impl TemporalEngine {
         Ok(())
     }
 
-    /// Serialize temporal record
+    /// Serialize temporal record using bincode for better performance
     fn serialize_record(&self, record: &TemporalRecord) -> Result<Vec<u8>, TemporalEngineError> {
-        // Simple serialization: morton_start(8) + morton_end(8) + key_len(4) + key + value_len(4) + value
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&record.morton_start.to_le_bytes());
-        buf.extend_from_slice(&record.morton_end.to_le_bytes());
-        buf.extend_from_slice(&(record.key.len() as u32).to_le_bytes());
-        buf.extend_from_slice(record.key.as_bytes());
-        buf.extend_from_slice(&(record.value.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&record.value);
-        Ok(buf)
+        bincode::serialize(record)
+            .map_err(|_| TemporalEngineError::SerializationError)
+    }
+
+    /// Find extent for Morton code or allocate new one using amortized strategy
+    fn find_or_allocate_extent_for_morton(&self, morton_code: u64) -> Result<u32, TemporalEngineError> {
+        // First check if existing extent can handle this Morton code
+        {
+            let interval_table = self.interval_table.read();
+            if let Some(extent_id) = interval_table.find_extent(morton_code) {
+                return Ok(extent_id);
+            }
+        }
+        
+        // No existing extent, need to allocate one
+        self.allocate_extent_for_morton(morton_code)
+    }
+
+    /// Allocate extent for Morton code using amortized pre-allocation
+    fn allocate_extent_for_morton(&self, morton_code: u64) -> Result<u32, TemporalEngineError> {
+        // Ensure we have enough pre-allocated extents
+        self.ensure_extent_pool_size()?;
+        
+        // Get a pre-allocated extent from the pool
+        let extent_id = {
+            let mut pool = self.extent_pool.write();
+            pool.pop().ok_or(TemporalEngineError::ExtentNotFound)?
+        };
+        
+        // Calculate Morton range for this extent (simple strategy for now)
+        let range_size = u64::MAX / 1024; // Divide space into 1024 ranges initially
+        let range_start = (morton_code / range_size) * range_size;
+        let range_end = range_start + range_size - 1;
+        
+        // Add to interval table
+        {
+            let mut interval_table = self.interval_table.write();
+            interval_table.insert(range_start, range_end, extent_id)
+                .map_err(TemporalEngineError::IntervalError)?;
+        }
+        
+        // Update extent metadata
+        {
+            let mut cache = self.extent_cache.write();
+            if let Some(metadata) = cache.get_mut(&extent_id) {
+                metadata.morton_start = range_start;
+                metadata.morton_end = range_end;
+            }
+        }
+        
+        Ok(extent_id)
+    }
+
+    /// Ensure extent pool has enough pre-allocated extents (amortized allocation)
+    fn ensure_extent_pool_size(&self) -> Result<(), TemporalEngineError> {
+        let current_pool_size = self.extent_pool.read().len();
+        
+        if current_pool_size < self.config.extent_pool_size as usize {
+            // Allocate a batch of extents to amortize allocation cost
+            self.allocate_extent_batch()?;
+        }
+        
+        Ok(())
+    }
+
+    /// Allocate a batch of extents (like Vec doubling strategy)
+    fn allocate_extent_batch(&self) -> Result<(), TemporalEngineError> {
+        let batch_size = self.config.extent_allocation_batch;
+        let mut new_extents = Vec::new();
+        
+        for _ in 0..batch_size {
+            let extent_id = self.next_extent_id.fetch_add(1, Ordering::Relaxed);
+            if extent_id > self.config.max_extents {
+                break; // Don't exceed max extents
+            }
+            
+            // Allocate extent storage
+            let offset = {
+                let mut storage = self.file_storage.lock().unwrap();
+                storage.allocate_extent(extent_id)?
+            };
+            
+            // Calculate max records per extent
+            let extent_size = {
+                let storage = self.file_storage.lock().unwrap();
+                storage.superblock().extent_size()
+            };
+            let header_size = 512u32;
+            let max_records = (extent_size - header_size) / 256;
+            
+            // Create metadata (will be updated when extent is actually used)
+            let metadata = TemporalExtentMetadata {
+                extent_id,
+                offset,
+                morton_start: 0, // Will be set when extent is assigned
+                morton_end: 0,   // Will be set when extent is assigned
+                record_count: 0,
+                max_records,
+            };
+            
+            // Add to cache
+            {
+                let mut cache = self.extent_cache.write();
+                cache.insert(extent_id, metadata);
+            }
+            
+            new_extents.push(extent_id);
+        }
+        
+        // Add all new extents to the pool
+        {
+            let mut pool = self.extent_pool.write();
+            pool.extend(new_extents);
+        }
+        
+        Ok(())
     }
 
     /// Flush active records to storage

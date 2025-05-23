@@ -8,8 +8,11 @@ pub mod extent;
 pub mod engine;
 pub mod file;
 pub mod file_engine;
+pub mod lockfree_file;
 pub mod lockfree_engine;
 pub mod temporal_engine;
+pub mod ultra_fast_engine;
+pub mod morton_vart_hybrid;
 pub mod transaction;
 pub mod transactional_engine;
 
@@ -90,6 +93,28 @@ pub use transactional_engine::{
     TransactionalEngineError,
     TransactionalEngineStats,
     TransactionHandle,
+};
+
+pub use lockfree_file::{
+    LockFreeFileStorage,
+    LockFreeFileConfig,
+    LockFreeFileStats,
+    LockFreeFileError,
+};
+
+pub use ultra_fast_engine::{
+    UltraFastTemporalEngine,
+    UltraFastEngineConfig,
+    UltraFastEngineStats,
+    UltraFastEngineError,
+    UltraFastTemporalRecord,
+};
+
+pub use morton_vart_hybrid::{
+    MortonVartEngine,
+    MortonRecord,
+    MortonVartStats,
+    MortonVartError,
 };
 
 #[cfg(test)]
