@@ -17,6 +17,7 @@ bitvec = "1.0.1"            # Bit manipulation for Z-order curve operations
 ahash = "0.8.7"             # Fast hashing
 memmap2 = "0.9.0"           # Memory mapping for large datasets
 parking_lot = "0.12.1"      # Efficient synchronization primitives
+smallvec = "1.13.1"         # Small vector optimization
 chrono = "0.4.26"           # Date and time utilities
 
 # Optional features
@@ -58,3 +59,7 @@ path = "examples/persistent.rs"
 [[example]]
 name = "mmap_test"
 path = "examples/mmap_test.rs"
+
+[[example]]
+name = "lockfree_benchmark"
+path = "examples/lockfree_benchmark.rs"

@@ -17,6 +17,19 @@ pub mod mmap_storage;
 /// Persistent implementation using memory-mapped storage
 pub mod persistent_zverse;
 
+/// Lock-free concurrency framework
+pub mod lockfree;
+
+/// Lock-free ZVerse implementation
+pub mod lockfree_zverse;
+
+/// Master-class tiered lock-free implementation
+pub mod master_class;
+
+/// Stress tests for master-class implementation
+#[cfg(test)]
+pub mod master_class_stress_tests;
+
 use chrono;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -32,6 +45,8 @@ pub use error::Error;
 pub use inmemory::InMemoryZVerse;
 pub use mmap_storage::MmapStorageManager;
 pub use persistent_zverse::PersistentZVerse;
+pub use lockfree_zverse::LockFreeZVerseKV;
+pub use master_class::{MasterClassZVerse, MasterClassConfig, SyncStrategy};
 
 /// Error types for ZVerse operations
 pub mod error {

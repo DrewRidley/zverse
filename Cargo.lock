@@ -1054,5 +1054,6 @@ dependencies = [
  "rand",
  "rayon",
  "serde",
+ "smallvec",
  "tempfile",
 ]
