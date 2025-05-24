@@ -1,2 +1,4 @@
 /target
 /*.db
+/test_data
+large_dataset_demo/*

@@ -38,6 +38,8 @@
 
 pub mod encoding;
 pub mod morton;
+pub mod disk;
 
 // Re-export main types for convenience
 pub use morton::{MortonError, MortonResult, MortonTemporalDB};
+pub use disk::{DiskConfig, DiskStorageManager, MmapPartition};
