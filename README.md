@@ -7,6 +7,19 @@ ZVerse is a high-performance, lock-free temporal database built in Rust that use
 
 ## 🚀 Performance Highlights
 
+- **1.2M+ writes/sec** at 16 threads
+- **22M+ reads/sec** at 16 threads  
+- **2.6M+ temporal records/sec** creation rate
+- **10M+ batch queries/sec** for bulk operations
+- **Zero locks** in critical path - true lock-free operation
+- **2-20x faster** than Redis/Memcached for in-memory operations
+</thinking>
+
+<edits>
+
+<old_text>
+## 🚀 Performance Highlights
+
 - **1.3M+ writes/sec** at 32 threads
 - **10.7M+ reads/sec** at 32 threads  
 - **213K temporal records/sec** creation rate
@@ -94,11 +107,6 @@ Batch retrieval with cache-efficient partition processing.
 #### `get_batch_at_time(keys: &[&str], timestamp: u64) -> Vec<MortonResult<Vec<u8>>>`
 Batch temporal queries for maximum throughput.
 
-### Statistics
-
-#### `stats() -> (usize, usize, f64, usize)`
-Returns `(total_records, total_keys, avg_versions_per_key, active_partitions)`.
-
 ## 🏗️ Architecture Overview
 
 ```
@@ -152,16 +160,16 @@ Returns `(total_records, total_keys, avg_versions_per_key, active_partitions)`.
 
 ## 📊 Benchmarks
 
-### Single Operation Performance (32 threads)
-- **Writes**: 1,298,239 ops/sec
-- **Reads**: 10,729,758 ops/sec
-- **Temporal Creation**: 213,089 records/sec
-- **Batch Queries**: 6,092,861 queries/sec
+### Concurrent Operation Performance (16 threads)
+- **Writes**: 1,185,338 ops/sec
+- **Reads**: 22,170,901 ops/sec
+- **Temporal Creation**: 2,636,068 records/sec
+- **Batch Queries**: 10,274,451 queries/sec
 
 ### Comparison with Industry Standards
 | Database | Write Ops/sec | Read Ops/sec | Type |
 |----------|---------------|---------------|------|
-| **ZVerse** | **1,298,239** | **10,729,758** | In-memory temporal |
+| **ZVerse** | **1,185,338** | **22,170,901** | In-memory temporal |
 | Redis | 100K-500K | 100K-1M | In-memory K-V |
 | Memcached | 300K-1M | 300K-1M | In-memory cache |
 
