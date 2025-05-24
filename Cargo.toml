@@ -32,3 +32,6 @@ harness = false
 
 [[example]]
 name = "large_dataset_demo"
+
+[[example]]
+name = "performance_shootout"
