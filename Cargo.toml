@@ -12,7 +12,16 @@ crossbeam-skiplist = "0.1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
 
 [[bench]]
 name = "database_bench"
+harness = false
+
+[[bench]]
+name = "large_scale_bench"
+harness = false
+
+[[bench]]
+name = "comprehensive_bench"
 harness = false

@@ -6,7 +6,7 @@
 //! # Performance
 //!
 //! - Non-transactional operations: ~132ns
-//! - Transactional operations: ~149ns  
+//! - Transactional operations: ~149ns
 //! - Batch operations: ~130ns per operation
 //! - Throughput: 6.8M-7.4M operations/second
 //!
@@ -38,20 +38,20 @@
 //!     // Temporal queries
 //!     db.put_at_time("price:AAPL", b"150.00", 1000)?;
 //!     let historical = db.get_at_time("price:AAPL", 1000).unwrap();
-//!     
+//!
 //!     Ok(())
 //! }
 //! ```
 
-use std::sync::atomic::{AtomicPtr, AtomicUsize, AtomicU64, AtomicU32, Ordering};
-use std::sync::Arc;
+use crossbeam_skiplist::SkipMap;
 use std::collections::HashMap;
+use std::mem;
 use std::ptr;
 use std::slice;
-use std::mem;
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
-use crossbeam_skiplist::SkipMap;
 
 const PAGE_SIZE: usize = 64 * 1024; // 64KB pages
 
@@ -60,7 +60,7 @@ const PAGE_SIZE: usize = 64 * 1024; // 64KB pages
 pub enum DatabaseError {
     /// Transaction conflict or invalid state
     TransactionError(String),
-    /// Memory allocation failure  
+    /// Memory allocation failure
     AllocationError,
     /// Invalid timestamp
     InvalidTimestamp,
@@ -107,7 +107,7 @@ pub struct Transaction {
 impl Transaction {
     fn new(read_only: bool) -> Self {
         let timestamp = current_timestamp_micros();
-        
+
         let id = THREAD_ID.with(|thread_id| {
             THREAD_TXN_COUNTER.with(|counter| {
                 let count = counter.get();
@@ -115,7 +115,7 @@ impl Transaction {
                 ((*thread_id as u64) << 32) | (count as u64)
             })
         });
-        
+
         Self {
             id,
             start_timestamp: timestamp,
@@ -124,7 +124,7 @@ impl Transaction {
             is_read_only: read_only,
         }
     }
-    
+
     fn add_pending_write(&mut self, temporal_key: TemporalKey, index_entry: IndexEntry) {
         if !self.is_read_only {
             self.pending_writes.insert(temporal_key, index_entry);
@@ -152,7 +152,10 @@ impl TransactionTracker {
 
     fn register_transaction(&self, timestamp: u64) -> Option<usize> {
         for (i, slot) in self.slots.iter().enumerate() {
-            if slot.compare_exchange(0, timestamp, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            if slot
+                .compare_exchange(0, timestamp, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
                 return Some(i);
             }
         }
@@ -211,7 +214,7 @@ impl TransactionManager {
     fn compute_flush_boundary(&self) -> u64 {
         let default_boundary = current_timestamp_micros().saturating_sub(1_000_000); // 1 second lag
         let earliest_active = self.tracker.get_earliest_active_timestamp();
-        
+
         if earliest_active == u64::MAX {
             default_boundary
         } else {
@@ -256,7 +259,7 @@ impl MemoryPage {
         let current_offset = self.header.write_offset.load(Ordering::Acquire);
         let aligned_offset = (current_offset + 7) & !7;
         let new_offset = aligned_offset + size;
-        
+
         if new_offset > self.data.len() {
             return None;
         }
@@ -273,8 +276,14 @@ impl MemoryPage {
     }
 
     fn update_timestamp_bounds(&self, timestamp: u64) {
-        let _ = self.header.min_timestamp.fetch_min(timestamp, Ordering::AcqRel);
-        let _ = self.header.max_timestamp.fetch_max(timestamp, Ordering::AcqRel);
+        let _ = self
+            .header
+            .min_timestamp
+            .fetch_min(timestamp, Ordering::AcqRel);
+        let _ = self
+            .header
+            .max_timestamp
+            .fetch_max(timestamp, Ordering::AcqRel);
     }
 }
 
@@ -313,7 +322,10 @@ struct TemporalKey {
 
 impl TemporalKey {
     fn new(morton_key: u64, timestamp: u64) -> Self {
-        Self { morton_key, timestamp }
+        Self {
+            morton_key,
+            timestamp,
+        }
     }
 }
 
@@ -366,7 +378,7 @@ impl Database {
     ) -> Result<()> {
         let morton_key = morton_encode_key(key);
         let key_bytes = key.as_bytes();
-        
+
         let record = RecordEntry {
             morton_key,
             timestamp,
@@ -380,12 +392,16 @@ impl Database {
         unsafe {
             let page = &self.pages[page_id];
             let data_ptr = page.data.as_ptr().add(offset) as *mut u8;
-            
+
             ptr::write_unaligned(data_ptr as *mut RecordEntry, record);
             let payload_ptr = data_ptr.add(RecordEntry::SIZE);
             ptr::copy_nonoverlapping(key_bytes.as_ptr(), payload_ptr, key_bytes.len());
-            ptr::copy_nonoverlapping(value.as_ptr(), payload_ptr.add(key_bytes.len()), value.len());
-            
+            ptr::copy_nonoverlapping(
+                value.as_ptr(),
+                payload_ptr.add(key_bytes.len()),
+                value.len(),
+            );
+
             page.update_timestamp_bounds(timestamp);
             page.header.record_count.fetch_add(1, Ordering::AcqRel);
         }
@@ -397,7 +413,7 @@ impl Database {
         };
 
         let temporal_key = TemporalKey::new(morton_key, timestamp);
-        
+
         if let Some(transaction) = txn {
             transaction.add_pending_write(temporal_key, index_entry);
         } else {
@@ -434,31 +450,31 @@ impl Database {
             // Check pending writes first - find latest write for this key
             let mut latest_pending: Option<&IndexEntry> = None;
             let mut latest_timestamp = 0;
-            
+
             for (temp_key, entry) in &transaction.pending_writes {
                 if temp_key.morton_key == morton_key && entry.timestamp > latest_timestamp {
                     latest_pending = Some(entry);
                     latest_timestamp = entry.timestamp;
                 }
             }
-            
+
             if let Some(entry) = latest_pending {
                 return self.read_from_entry(entry);
             }
         }
-        
+
         // Find the latest entry for this key at or before the given timestamp
         let start_key = TemporalKey::new(morton_key, 0);
         let end_key = TemporalKey::new(morton_key, timestamp);
-        
+
         let mut latest_entry: Option<IndexEntry> = None;
-        
+
         for entry in self.index.range(start_key..=end_key) {
             if entry.key().morton_key == morton_key {
                 latest_entry = Some(*entry.value());
             }
         }
-        
+
         if let Some(entry) = latest_entry {
             if let Some(transaction) = txn {
                 if entry.timestamp > transaction.read_timestamp {
@@ -503,12 +519,12 @@ impl Database {
         unsafe {
             let page = &self.pages[entry.page_id];
             let data_ptr = page.data.as_ptr().add(entry.offset);
-            
+
             let _morton_key = ptr::read_unaligned(data_ptr as *const u64);
             let _timestamp = ptr::read_unaligned(data_ptr.add(8) as *const u64);
             let key_len = ptr::read_unaligned(data_ptr.add(16) as *const u16);
             let value_len = ptr::read_unaligned(data_ptr.add(18) as *const u32);
-            
+
             let value_offset = RecordEntry::SIZE + key_len as usize;
             let value_ptr = data_ptr.add(value_offset);
             let value_slice = slice::from_raw_parts(value_ptr, value_len as usize);
@@ -518,22 +534,22 @@ impl Database {
 
     fn allocate_space(&self, size: usize) -> Result<(usize, usize)> {
         let num_pages = self.pages.len();
-        
+
         let start_page = LAST_PAGE_INDEX.with(|last_idx| {
             let idx = last_idx.get();
             last_idx.set((idx + 1) % num_pages);
             idx
         });
-        
+
         for i in 0..num_pages {
             let page_idx = (start_page + i) % num_pages;
             let page = &self.pages[page_idx];
-            
+
             if let Some(offset) = page.try_allocate(size) {
                 return Ok((page_idx, offset));
             }
         }
-        
+
         Err(DatabaseError::AllocationError)
     }
 }
@@ -568,7 +584,7 @@ mod tests {
     #[test]
     fn test_basic_operations() {
         let db = Database::new();
-        
+
         assert!(db.put("key1", b"value1").is_ok());
         assert_eq!(db.get("key1").unwrap(), b"value1");
         assert!(db.get("nonexistent").is_none());
@@ -577,22 +593,22 @@ mod tests {
     #[test]
     fn test_transactions() {
         let db = Database::new();
-        
+
         let (mut txn, slot_id) = db.begin_transaction();
         assert!(db.put_txn(&mut txn, "key1", b"value1").is_ok());
         assert_eq!(db.get_txn(&txn, "key1").unwrap(), b"value1");
         assert!(db.commit_transaction(txn, slot_id).is_ok());
-        
+
         assert_eq!(db.get("key1").unwrap(), b"value1");
     }
 
     #[test]
     fn test_temporal_queries() {
         let db = Database::new();
-        
+
         assert!(db.put_at_time("key1", b"value1", 1000).is_ok());
         assert!(db.put_at_time("key1", b"value2", 2000).is_ok());
-        
+
         assert_eq!(db.get_at_time("key1", 1500).unwrap(), b"value1");
         assert_eq!(db.get_at_time("key1", 2500).unwrap(), b"value2");
     }
