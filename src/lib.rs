@@ -521,7 +521,7 @@ impl LockFreeCommitLog {
 /// High-performance lock-free temporal database
 pub struct Database {
     pages: Vec<Arc<MemoryPage>>,
-    index: AtomicPtr<LockFreeIndex>,
+    index: Arc<LockFreeIndex>,
     commit_log: LockFreeCommitLog,
     transaction_manager: Arc<TransactionManager>,
     background_applier_running: Arc<AtomicBool>,
@@ -537,12 +537,11 @@ impl Database {
             pages.push(Arc::new(*MemoryPage::new()));
         }
 
-        let initial_index = Box::into_raw(Box::new(SkipMap::new()));
         let background_applier_running = Arc::new(AtomicBool::new(true));
 
         let mut db = Self {
             pages,
-            index: AtomicPtr::new(initial_index),
+            index: Arc::new(SkipMap::new()),
             commit_log: LockFreeCommitLog::new(COMMIT_LOG_CAPACITY),
             transaction_manager: Arc::new(TransactionManager::new()),
             background_applier_running: background_applier_running.clone(),
@@ -614,8 +613,7 @@ impl Database {
         if let Some(transaction) = txn {
             transaction.add_pending_write(temporal_key, index_entry);
         } else {
-            let current_index = unsafe { &*self.index.load(Ordering::Acquire) };
-            current_index.insert(temporal_key, index_entry);
+            self.index.insert(temporal_key, index_entry);
         }
 
         Ok(())
@@ -662,7 +660,7 @@ impl Database {
         }
 
         // Find the latest entry for this key at or before the given timestamp
-        let current_index = unsafe { &*self.index.load(Ordering::Acquire) };
+        let current_index = &*self.index;
         let start_key = TemporalKey::new(morton_key, 0);
         let end_key = TemporalKey::new(morton_key, timestamp);
 
@@ -711,8 +709,7 @@ impl Database {
         let _commit_guard = self.commit_mutex.lock().unwrap();
         
         // Step 1: Check for write-write conflicts (only against published writes)
-        let current_index_ptr = self.index.load(Ordering::Acquire);
-        let current_index = unsafe { &*current_index_ptr };
+        let current_index = &*self.index;
         
         for (temporal_key, _) in &txn.pending_writes {
             let morton_key = temporal_key.morton_key;
@@ -734,7 +731,7 @@ impl Database {
         // Step 3: Insert all writes with unpublished write set
         for (temporal_key, mut entry) in txn.pending_writes.drain() {
             entry.write_set = Some(write_set.clone());
-            current_index.insert(temporal_key, entry);
+            self.index.insert(temporal_key, entry);
         }
 
         // Step 4: Atomically publish all writes
@@ -871,13 +868,7 @@ impl Drop for Database {
             let _ = handle.join();
         }
 
-        // Clean up the index pointer
-        let index_ptr = self.index.load(Ordering::Acquire);
-        if !index_ptr.is_null() {
-            unsafe {
-                let _ = Box::from_raw(index_ptr);
-            }
-        }
+        // Arc will automatically clean up the index
     }
 }
 
