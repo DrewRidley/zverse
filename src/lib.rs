@@ -355,6 +355,8 @@ impl TemporalKey {
 /// Lock-free skiplist index with temporal support
 type LockFreeIndex = SkipMap<TemporalKey, IndexEntry>;
 
+
+
 /// Atomic write in a transaction commit log
 #[derive(Copy, Clone)]
 struct CommitWrite {
@@ -659,7 +661,7 @@ impl Database {
         
         for (temporal_key, _) in &txn.pending_writes {
             let morton_key = temporal_key.morton_key;
-            let start_key = TemporalKey::new(morton_key, txn.start_timestamp);
+            let start_key = TemporalKey::new(morton_key, txn.start_timestamp + 1);
             let end_key = TemporalKey::new(morton_key, u64::MAX);
             
             // Check if any version of this key was committed after our transaction started
@@ -838,6 +840,7 @@ fn current_timestamp_micros() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::Rng;
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
