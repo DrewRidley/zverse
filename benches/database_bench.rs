@@ -113,8 +113,9 @@ fn concurrent_operations(c: &mut Criterion) {
             BenchmarkId::new("concurrent_writes", num_threads),
             num_threads,
             |b, &num_threads| {
+                let db = Arc::new(Database::new());
+                
                 b.iter_custom(|iters| {
-                    let db = Arc::new(Database::new());
                     let operations_per_thread = (iters / num_threads as u64).max(1);
 
                     let start = std::time::Instant::now();
