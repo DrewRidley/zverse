@@ -14,6 +14,7 @@ fn seeded_rng(seed: u64) -> impl Rng {
 // Basic MVCC operations
 pub fn mvcc_basic_ops(c: &mut Criterion) {
     let mut group = c.benchmark_group("mvcc_basic_ops");
+    group.sample_size(10);
     group.throughput(Throughput::Elements(1));
     
     // Non-transactional baseline
@@ -70,6 +71,7 @@ pub fn mvcc_basic_ops(c: &mut Criterion) {
 // Read performance with MVCC
 pub fn mvcc_read_performance(c: &mut Criterion) {
     let mut group = c.benchmark_group("mvcc_read_performance");
+    group.sample_size(10);
     group.throughput(Throughput::Elements(1));
 
     // Setup: pre-populate database
@@ -113,6 +115,7 @@ pub fn mvcc_read_performance(c: &mut Criterion) {
 // Concurrent transaction performance
 pub fn mvcc_concurrent_transactions(c: &mut Criterion) {
     let mut group = c.benchmark_group("mvcc_concurrent_transactions");
+    group.sample_size(10);
     
     for num_threads in [1, 2, 4, 8, 16].iter() {
         group.bench_with_input(
@@ -154,6 +157,7 @@ pub fn mvcc_concurrent_transactions(c: &mut Criterion) {
 // Long-running vs short transactions
 pub fn mvcc_transaction_duration(c: &mut Criterion) {
     let mut group = c.benchmark_group("mvcc_transaction_duration");
+    group.sample_size(10);
     group.throughput(Throughput::Elements(1));
 
     // Short transactions (single operation)
@@ -208,6 +212,7 @@ pub fn mvcc_transaction_duration(c: &mut Criterion) {
 // Mixed workload performance
 pub fn mvcc_mixed_workload(c: &mut Criterion) {
     let mut group = c.benchmark_group("mvcc_mixed_workload");
+    group.sample_size(10);
     group.throughput(Throughput::Elements(1));
 
     // Setup: pre-populate database
@@ -273,6 +278,7 @@ pub fn mvcc_mixed_workload(c: &mut Criterion) {
 // Rollback performance
 pub fn mvcc_rollback_performance(c: &mut Criterion) {
     let mut group = c.benchmark_group("mvcc_rollback_performance");
+    group.sample_size(10);
     group.throughput(Throughput::Elements(1));
 
     // Rollback after single operation
@@ -311,6 +317,7 @@ pub fn mvcc_rollback_performance(c: &mut Criterion) {
 // Scalability tests
 pub fn mvcc_scalability(c: &mut Criterion) {
     let mut group = c.benchmark_group("mvcc_scalability");
+    group.sample_size(10);
 
     // Scale by number of records in transaction
     for num_ops in [1, 10, 100, 1000, 10000].iter() {
@@ -341,6 +348,7 @@ pub fn mvcc_scalability(c: &mut Criterion) {
 // Snapshot isolation validation
 pub fn mvcc_snapshot_isolation(c: &mut Criterion) {
     let mut group = c.benchmark_group("mvcc_snapshot_isolation");
+    group.sample_size(10);
     group.throughput(Throughput::Elements(1));
 
     group.bench_function("concurrent_snapshot_reads", |b| {
@@ -386,6 +394,7 @@ pub fn mvcc_snapshot_isolation(c: &mut Criterion) {
 // Flush boundary interaction
 pub fn mvcc_flush_interaction(c: &mut Criterion) {
     let mut group = c.benchmark_group("mvcc_flush_interaction");
+    group.sample_size(10);
     group.throughput(Throughput::Elements(1));
 
     group.bench_function("transactions_with_flush_pressure", |b| {

@@ -12,6 +12,8 @@ use std::slice;
 use std::mem;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use crossbeam_skiplist::SkipMap;
+use bumpalo::Bump;
 
 const PAGE_SIZE: usize = 64 * 1024; // 64KB pages
 const MAX_PAGES: usize = 65536; // Support up to 4GB memory
@@ -77,7 +79,6 @@ impl Transaction {
     }
 }
 
-/// MVCC Transaction Manager
 /// Lock-free transaction tracking using atomic operations
 struct LockFreeTransactionTracker {
     slots: Vec<AtomicU64>, // Each slot holds a transaction timestamp (0 = empty)
@@ -316,78 +317,10 @@ struct IndexEntry {
     timestamp: u64,
 }
 
-/// Simple lock-free hash table using atomic operations
-struct LockFreeIndex {
-    buckets: Vec<AtomicPtr<IndexNode>>,
-    bucket_count: usize,
-}
+/// Lock-free skiplist index for O(log N) operations with excellent concurrent performance
+type LockFreeIndex = SkipMap<u64, IndexEntry>;
 
-struct IndexNode {
-    morton_key: u64,
-    entry: IndexEntry,
-    next: AtomicPtr<IndexNode>,
-}
 
-impl LockFreeIndex {
-    fn new(bucket_count: usize) -> Self {
-        let mut buckets = Vec::with_capacity(bucket_count);
-        for _ in 0..bucket_count {
-            buckets.push(AtomicPtr::new(ptr::null_mut()));
-        }
-        
-        Self {
-            buckets,
-            bucket_count,
-        }
-    }
-
-    fn hash(&self, morton_key: u64) -> usize {
-        // Simple but effective hash
-        (morton_key.wrapping_mul(0x9e3779b97f4a7c15)) as usize % self.bucket_count
-    }
-
-    fn insert(&self, morton_key: u64, entry: IndexEntry) {
-        let bucket_idx = self.hash(morton_key);
-        let new_node = Box::into_raw(Box::new(IndexNode {
-            morton_key,
-            entry,
-            next: AtomicPtr::new(ptr::null_mut()),
-        }));
-
-        loop {
-            let head = self.buckets[bucket_idx].load(Ordering::Acquire);
-            unsafe {
-                (*new_node).next.store(head, Ordering::Relaxed);
-            }
-            
-            match self.buckets[bucket_idx].compare_exchange_weak(
-                head,
-                new_node,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(_) => continue,
-            }
-        }
-    }
-
-    fn get(&self, morton_key: u64) -> Option<IndexEntry> {
-        let bucket_idx = self.hash(morton_key);
-        let mut current = self.buckets[bucket_idx].load(Ordering::Acquire);
-
-        while !current.is_null() {
-            unsafe {
-                let node = &*current;
-                if node.morton_key == morton_key {
-                    return Some(node.entry.clone());
-                }
-                current = node.next.load(Ordering::Acquire);
-            }
-        }
-        None
-    }
-}
 
 /// Revolutionary lock-free temporal database
 /// Thread-local page allocation to reduce contention
@@ -398,8 +331,8 @@ thread_local! {
 pub struct RevolutionaryDB {
     /// Active memory pages
     pages: Vec<Arc<MemoryPage>>,
-    /// Lock-free index for O(1) lookups
-    index: LockFreeIndex,
+    /// Lock-free skiplist index for O(log N) lookups with excellent concurrency
+    index: Arc<LockFreeIndex>,
     /// Background flusher handle
     flusher_handle: Option<thread::JoinHandle<()>>,
     /// Shutdown signal
@@ -427,7 +360,7 @@ impl RevolutionaryDB {
 
         Self {
             pages,
-            index: LockFreeIndex::new(65536), // 64K buckets
+            index: Arc::new(SkipMap::new()),
             flusher_handle: Some(flusher_handle),
             shutdown,
             transaction_manager,
@@ -490,7 +423,6 @@ impl RevolutionaryDB {
         if let Some(transaction) = txn {
             // MVCC: Add to transaction's pending writes (not visible to others yet)
             transaction.add_pending_write(morton_key, index_entry);
-            // Protect timestamp from flushing until commit
             // Transaction timestamp is now automatically tracked in lock-free manner
         } else {
             // Non-transactional write: immediately visible
@@ -520,7 +452,7 @@ impl RevolutionaryDB {
         }
         
         // Then check global index for committed data
-        let entry = self.index.get(morton_key)?;
+        let entry = self.index.get(&morton_key)?.value().clone();
         
         // MVCC visibility: only see data committed before our read timestamp
         if let Some(transaction) = txn {
@@ -590,7 +522,7 @@ impl RevolutionaryDB {
     
     /// Commit a transaction
     pub fn commit_transaction(&self, txn: Transaction, slot_id: Option<usize>) -> Result<(), String> {
-        self.transaction_manager.commit_transaction(txn, slot_id, &self.index)
+        self.transaction_manager.commit_transaction(txn, slot_id, &*self.index)
     }
     
     /// Rollback a transaction
