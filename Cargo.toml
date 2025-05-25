@@ -8,6 +8,8 @@ memmap2 = "0.9"
 byteorder = "1.5"
 parking_lot = "0.12"
 crossbeam-utils = "0.8"
+crossbeam-skiplist = "0.3"
+bumpalo = "3.0"
 dashmap = "5.5"
 rand = "0.8"
 smallvec = "1.0"
@@ -28,6 +30,10 @@ harness = false
 
 [[bench]]
 name = "temporal_versioning"
+harness = false
+
+[[bench]]
+name = "revolutionary_mvcc_bench"
 harness = false
 
 [[example]]

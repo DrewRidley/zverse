@@ -3,9 +3,9 @@
 //! Zero-coordination temporal database using atomic transaction boundaries
 //! and lock-free memory pages for maximum performance.
 
-use std::sync::atomic::{AtomicU64, AtomicPtr, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
-use std::collections::{HashMap, BTreeSet};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, AtomicU64, AtomicU32, Ordering};
+use std::sync::Arc;
+use std::collections::HashMap;
 use std::ptr;
 
 use std::slice;
@@ -20,8 +20,16 @@ const FLUSH_BATCH_SIZE: usize = 10000;
 /// Global transaction boundary - records below this timestamp can be safely flushed
 static FLUSH_BOUNDARY: AtomicU64 = AtomicU64::new(0);
 
-/// Global transaction ID counter
-static TRANSACTION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+/// Thread-local transaction ID generator to avoid contention
+thread_local! {
+    static THREAD_ID: u32 = {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    };
+    static THREAD_TXN_COUNTER: std::cell::Cell<u32> = std::cell::Cell::new(0);
+}
+
+
 
 /// Transaction state for MVCC with deferred index updates
 #[derive(Debug)]
@@ -35,8 +43,16 @@ pub struct Transaction {
 
 impl Transaction {
     fn new(read_only: bool) -> Self {
-        let id = TRANSACTION_ID_COUNTER.fetch_add(1, Ordering::AcqRel);
         let timestamp = current_timestamp_micros();
+        
+        // Generate thread-local unique ID to avoid contention
+        let id = THREAD_ID.with(|thread_id| {
+            THREAD_TXN_COUNTER.with(|counter| {
+                let count = counter.get();
+                counter.set(count.wrapping_add(1));
+                ((*thread_id as u64) << 32) | (count as u64)
+            })
+        });
         
         Self {
             id,
@@ -62,98 +78,111 @@ impl Transaction {
 }
 
 /// MVCC Transaction Manager
+/// Lock-free transaction tracking using atomic operations
+struct LockFreeTransactionTracker {
+    slots: Vec<AtomicU64>, // Each slot holds a transaction timestamp (0 = empty)
+    slot_count: usize,
+}
+
+impl LockFreeTransactionTracker {
+    fn new(max_concurrent_transactions: usize) -> Self {
+        let mut slots = Vec::with_capacity(max_concurrent_transactions);
+        for _ in 0..max_concurrent_transactions {
+            slots.push(AtomicU64::new(0));
+        }
+        Self {
+            slots,
+            slot_count: max_concurrent_transactions,
+        }
+    }
+
+    fn register_transaction(&self, timestamp: u64) -> Option<usize> {
+        // Find an empty slot using round-robin
+        for i in 0..self.slot_count {
+            if self.slots[i].compare_exchange_weak(0, timestamp, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                return Some(i);
+            }
+        }
+        None // All slots full
+    }
+
+    fn unregister_transaction(&self, slot_id: usize) {
+        self.slots[slot_id].store(0, Ordering::Release);
+    }
+
+    fn get_min_active_timestamp(&self) -> u64 {
+        let mut min_timestamp = u64::MAX;
+        for slot in &self.slots {
+            let timestamp = slot.load(Ordering::Acquire);
+            if timestamp != 0 && timestamp < min_timestamp {
+                min_timestamp = timestamp;
+            }
+        }
+        if min_timestamp == u64::MAX { 0 } else { min_timestamp }
+    }
+}
+
 pub struct TransactionManager {
-    active_transactions: Arc<RwLock<HashMap<u64, Transaction>>>,
-    protected_timestamps: Arc<RwLock<BTreeSet<u64>>>, // Timestamps that cannot be flushed
+    transaction_tracker: LockFreeTransactionTracker,
 }
 
 impl TransactionManager {
     fn new() -> Self {
         Self {
-            active_transactions: Arc::new(RwLock::new(HashMap::new())),
-            protected_timestamps: Arc::new(RwLock::new(BTreeSet::new())),
+            transaction_tracker: LockFreeTransactionTracker::new(1024), // Support up to 1024 concurrent transactions
         }
     }
     
-    fn begin_transaction(&self, read_only: bool) -> Transaction {
+    fn begin_transaction(&self, read_only: bool) -> (Transaction, Option<usize>) {
         let txn = Transaction::new(read_only);
-        let mut active_txns = self.active_transactions.write().unwrap();
+        let slot_id = if !read_only {
+            self.transaction_tracker.register_transaction(txn.start_timestamp)
+        } else {
+            None
+        };
         
-        // Add to active transaction tracking
-        let txn_id = txn.id;
-        active_txns.insert(txn_id, txn);
-        // Return a new transaction with the same properties for the caller
-        Transaction {
-            id: txn_id,
-            start_timestamp: active_txns[&txn_id].start_timestamp,
-            read_timestamp: active_txns[&txn_id].read_timestamp,
-            pending_writes: HashMap::new(),
-            is_read_only: active_txns[&txn_id].is_read_only,
-        }
+        (txn, slot_id)
     }
     
-    fn commit_transaction(&self, txn: Transaction, global_index: &LockFreeIndex) -> Result<(), String> {
+    fn commit_transaction(&self, txn: Transaction, slot_id: Option<usize>, global_index: &LockFreeIndex) -> Result<(), String> {
         // Atomically make all pending writes visible by adding to global index
         for (morton_key, index_entry) in &txn.pending_writes {
             global_index.insert(*morton_key, index_entry.clone());
         }
         
-        // Remove from active transaction tracking
-        let mut active_txns = self.active_transactions.write().unwrap();
-        active_txns.remove(&txn.id);
-        
-        // Remove timestamps from protection (they're now committed and visible)
-        let mut protected_timestamps = self.protected_timestamps.write().unwrap();
-        for timestamp in txn.get_pending_timestamps() {
-            protected_timestamps.remove(&timestamp);
+        // Unregister transaction from lock-free tracker
+        if let Some(slot) = slot_id {
+            self.transaction_tracker.unregister_transaction(slot);
         }
         
         Ok(())
     }
     
-    fn rollback_transaction(&self, txn: Transaction) {
-        // Remove from active tracking
-        let mut active_txns = self.active_transactions.write().unwrap();
-        active_txns.remove(&txn.id);
-        
-        // Remove timestamps from protection
-        let mut protected_timestamps = self.protected_timestamps.write().unwrap();
-        for timestamp in txn.get_pending_timestamps() {
-            protected_timestamps.remove(&timestamp);
+    fn rollback_transaction(&self, _txn: Transaction, slot_id: Option<usize>) {
+        // Unregister transaction from lock-free tracker
+        if let Some(slot) = slot_id {
+            self.transaction_tracker.unregister_transaction(slot);
         }
         
         // Pending writes are simply dropped - they were never visible to other transactions
         // The records in memory pages become unreachable garbage
     }
     
-    /// Calculate safe flush boundary excluding protected timestamps
+    /// Calculate safe flush boundary using lock-free transaction tracking
     fn calculate_safe_flush_boundary(&self) -> u64 {
         let current_time = current_timestamp_micros();
         let default_boundary = current_time.saturating_sub(5_000_000); // 5 second default lag
         
-        let protected_timestamps = self.protected_timestamps.read().unwrap();
+        // Get the earliest active transaction timestamp
+        let earliest_active = self.transaction_tracker.get_min_active_timestamp();
         
-        // Find the earliest protected timestamp
-        let earliest_protected = protected_timestamps
-            .iter()
-            .copied()
-            .min()
-            .unwrap_or(current_time);
-            
-        // Use the more conservative boundary
-        default_boundary.min(earliest_protected)
-    }
-    
-    /// Add timestamp to protection list (called when transaction writes)
-    fn protect_timestamp(&self, timestamp: u64) {
-        let mut protected_timestamps = self.protected_timestamps.write().unwrap();
-        protected_timestamps.insert(timestamp);
-    }
-    
-    /// Check if a timestamp is safe to flush
-    fn is_timestamp_safe_to_flush(&self, timestamp: u64) -> bool {
-        let protected_timestamps = self.protected_timestamps.read().unwrap();
-        !protected_timestamps.contains(&timestamp)
+        if earliest_active == 0 {
+            // No active transactions
+            default_boundary
+        } else {
+            // Use the more conservative boundary
+            default_boundary.min(earliest_active)
+        }
     }
 }
 
@@ -361,11 +390,14 @@ impl LockFreeIndex {
 }
 
 /// Revolutionary lock-free temporal database
+/// Thread-local page allocation to reduce contention
+thread_local! {
+    static LAST_PAGE_INDEX: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
 pub struct RevolutionaryDB {
     /// Active memory pages
     pages: Vec<Arc<MemoryPage>>,
-    /// Current page index for round-robin allocation
-    current_page: AtomicUsize,
     /// Lock-free index for O(1) lookups
     index: LockFreeIndex,
     /// Background flusher handle
@@ -395,7 +427,6 @@ impl RevolutionaryDB {
 
         Self {
             pages,
-            current_page: AtomicUsize::new(0),
             index: LockFreeIndex::new(65536), // 64K buckets
             flusher_handle: Some(flusher_handle),
             shutdown,
@@ -460,7 +491,7 @@ impl RevolutionaryDB {
             // MVCC: Add to transaction's pending writes (not visible to others yet)
             transaction.add_pending_write(morton_key, index_entry);
             // Protect timestamp from flushing until commit
-            self.transaction_manager.protect_timestamp(timestamp);
+            // Transaction timestamp is now automatically tracked in lock-free manner
         } else {
             // Non-transactional write: immediately visible
             self.index.insert(morton_key, index_entry);
@@ -508,8 +539,8 @@ impl RevolutionaryDB {
             let data_ptr = page.data.as_ptr().add(entry.offset);
             
             // Read RecordEntry fields individually to avoid alignment issues
-            let morton_key = ptr::read_unaligned(data_ptr as *const u64);
-            let timestamp = ptr::read_unaligned(data_ptr.add(8) as *const u64);
+            let _morton_key = ptr::read_unaligned(data_ptr as *const u64);
+            let _timestamp = ptr::read_unaligned(data_ptr.add(8) as *const u64);
             let key_len = ptr::read_unaligned(data_ptr.add(16) as *const u16);
             let value_len = ptr::read_unaligned(data_ptr.add(18) as *const u32);
             
@@ -523,15 +554,21 @@ impl RevolutionaryDB {
 
     fn allocate_space(&self, size: usize) -> Result<(usize, usize), String> {
         let num_pages = self.pages.len();
-        let start_page = self.current_page.load(Ordering::Acquire) % num_pages;
         
-        // Try round-robin allocation
+        // Use thread-local starting point to reduce contention
+        let start_page = LAST_PAGE_INDEX.with(|last_idx| {
+            let idx = last_idx.get();
+            last_idx.set((idx + 1) % num_pages);
+            idx
+        });
+        
+        // Try allocation starting from thread-local hint
         for i in 0..num_pages {
             let page_idx = (start_page + i) % num_pages;
             let page = &self.pages[page_idx];
             
             if let Some(offset) = page.try_allocate(size) {
-                self.current_page.store(page_idx, Ordering::Relaxed);
+                LAST_PAGE_INDEX.with(|last_idx| last_idx.set(page_idx));
                 return Ok((page_idx, offset));
             }
         }
@@ -547,18 +584,18 @@ impl RevolutionaryDB {
     }
     
     /// Begin a new transaction
-    pub fn begin_transaction(&self, read_only: bool) -> Transaction {
+    pub fn begin_transaction(&self, read_only: bool) -> (Transaction, Option<usize>) {
         self.transaction_manager.begin_transaction(read_only)
     }
     
     /// Commit a transaction
-    pub fn commit_transaction(&self, txn: Transaction) -> Result<(), String> {
-        self.transaction_manager.commit_transaction(txn, &self.index)
+    pub fn commit_transaction(&self, txn: Transaction, slot_id: Option<usize>) -> Result<(), String> {
+        self.transaction_manager.commit_transaction(txn, slot_id, &self.index)
     }
     
     /// Rollback a transaction
-    pub fn rollback_transaction(&self, txn: Transaction) {
-        self.transaction_manager.rollback_transaction(txn)
+    pub fn rollback_transaction(&self, txn: Transaction, slot_id: Option<usize>) {
+        self.transaction_manager.rollback_transaction(txn, slot_id)
     }
     
     /// Transactional put operation

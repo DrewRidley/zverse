@@ -1,0 +1,31 @@
+mvcc_basic_ops/non_transactional_put
+                        time:   [180.76 ns 185.80 ns 191.38 ns]
+                        thrpt:  [5.2253 Melem/s 5.3823 Melem/s 5.5322 Melem/s]
+mvcc_basic_ops/transactional_put
+                        time:   [305.74 ns 313.82 ns 323.56 ns]
+                        thrpt:  [3.0906 Melem/s 3.1865 Melem/s 3.2707 Melem/s]
+mvcc_basic_ops/batch_transactional_put/10
+                        time:   [1.9545 µs 2.0120 µs 2.0803 µs]
+                        thrpt:  [480.70 Kelem/s 497.01 Kelem/s 511.65 Kelem/s]
+mvcc_basic_ops/batch_transactional_put/100
+                        time:   [12.761 µs 13.178 µs 13.711 µs]
+                        thrpt:  [72.935 Kelem/s 75.885 Kelem/s 78.363 Kelem/s]
+mvcc_basic_ops/batch_transactional_put/1000
+                        time:   [153.76 µs 157.96 µs 162.52 µs]
+                        thrpt:  [6.1530 Kelem/s 6.3305 Kelem/s 6.5035 Kelem/s]
+mvcc_read_performance/transactional_read
+                        time:   [131.65 ns 132.76 ns 134.08 ns]
+                        thrpt:  [7.4583 Melem/s 7.5321 Melem/s 7.5957 Melem/s]
+mvcc_read_performance/temporal_read
+                        time:   [56.351 ns 56.861 ns 57.470 ns]
+                        thrpt:  [17.400 Melem/s 17.587 Melem/s 17.746 Melem/s]
+mvcc_concurrent_transactions/concurrent_writes/1
+                        time:   [126.36 µs 137.68 µs 149.53 µs]
+mvcc_concurrent_transactions/concurrent_writes/2
+                        time:   [83.599 µs 92.080 µs 101.30 µs]
+mvcc_concurrent_transactions/concurrent_writes/4
+                        time:   [151.26 µs 170.77 µs 191.31 µs]
+mvcc_concurrent_transactions/concurrent_writes/8
+                        time:   [293.84 µs 328.36 µs 363.95 µs]
+mvcc_concurrent_transactions/concurrent_writes/16
+                        time:   [392.68 µs 453.58 µs 522.11 µs]
