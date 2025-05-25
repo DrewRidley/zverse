@@ -328,12 +328,64 @@ impl RecordEntry {
     }
 }
 
-/// Index entry pointing to page and offset
-#[derive(Debug, Clone, Copy)]
+/// Atomic write set for transaction publication
+#[derive(Debug)]
+struct WriteSet {
+    transaction_id: u64,
+    published: AtomicBool,
+}
+
+impl WriteSet {
+    fn new(transaction_id: u64) -> Arc<Self> {
+        Arc::new(Self {
+            transaction_id,
+            published: AtomicBool::new(false),
+        })
+    }
+    
+    fn publish(&self) {
+        self.published.store(true, Ordering::Release);
+    }
+    
+    fn is_published(&self) -> bool {
+        self.published.load(Ordering::Acquire)
+    }
+}
+
+/// Index entry pointing to page and offset with optional write set for atomic publication
+#[derive(Debug, Clone)]
 struct IndexEntry {
     page_id: usize,
     offset: usize,
     timestamp: u64,
+    write_set: Option<Arc<WriteSet>>,
+}
+
+impl IndexEntry {
+    fn new(page_id: usize, offset: usize, timestamp: u64) -> Self {
+        Self {
+            page_id,
+            offset,
+            timestamp,
+            write_set: None,
+        }
+    }
+    
+    fn with_write_set(page_id: usize, offset: usize, timestamp: u64, write_set: Arc<WriteSet>) -> Self {
+        Self {
+            page_id,
+            offset,
+            timestamp,
+            write_set: Some(write_set),
+        }
+    }
+    
+    fn is_visible(&self) -> bool {
+        match &self.write_set {
+            Some(ws) => ws.is_published(),
+            None => true, // Non-transactional writes are always visible
+        }
+    }
 }
 
 /// Composite key for temporal indexing: combines morton key and timestamp
@@ -358,7 +410,7 @@ type LockFreeIndex = SkipMap<TemporalKey, IndexEntry>;
 
 
 /// Atomic write in a transaction commit log
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 struct CommitWrite {
     temporal_key: TemporalKey,
     index_entry: IndexEntry,
@@ -371,7 +423,7 @@ struct CommitLogEntry {
     commit_timestamp: AtomicU64,
     write_count: AtomicU32,
     status: AtomicU8,
-    writes: std::cell::UnsafeCell<[CommitWrite; MAX_WRITES_PER_TXN]>,
+    writes: std::cell::UnsafeCell<Vec<CommitWrite>>,
 }
 
 // Safety: CommitLogEntry can be safely sent between threads because:
@@ -384,17 +436,20 @@ unsafe impl Sync for CommitLogEntry {}
 
 impl CommitLogEntry {
     fn new() -> Self {
-        const INIT_WRITE: CommitWrite = CommitWrite {
-            temporal_key: TemporalKey { morton_key: 0, timestamp: 0 },
-            index_entry: IndexEntry { page_id: 0, offset: 0, timestamp: 0 },
-        };
+        let mut writes = Vec::with_capacity(MAX_WRITES_PER_TXN);
+        for _ in 0..MAX_WRITES_PER_TXN {
+            writes.push(CommitWrite {
+                temporal_key: TemporalKey { morton_key: 0, timestamp: 0 },
+                index_entry: IndexEntry::new(0, 0, 0),
+            });
+        }
         
         Self {
             transaction_id: AtomicU64::new(0),
             commit_timestamp: AtomicU64::new(0),
             write_count: AtomicU32::new(0),
             status: AtomicU8::new(AVAILABLE),
-            writes: std::cell::UnsafeCell::new([INIT_WRITE; MAX_WRITES_PER_TXN]),
+            writes: std::cell::UnsafeCell::new(writes),
         }
     }
 
@@ -552,11 +607,7 @@ impl Database {
             page.header.record_count.fetch_add(1, Ordering::AcqRel);
         }
 
-        let index_entry = IndexEntry {
-            page_id,
-            offset,
-            timestamp,
-        };
+        let index_entry = IndexEntry::new(page_id, offset, timestamp);
 
         let temporal_key = TemporalKey::new(morton_key, timestamp);
 
@@ -619,7 +670,11 @@ impl Database {
 
         for entry in current_index.range(start_key..=end_key) {
             if entry.key().morton_key == morton_key {
-                latest_entry = Some(*entry.value());
+                let index_entry = entry.value();
+                // Only consider visible entries (published transactions)
+                if index_entry.is_visible() {
+                    latest_entry = Some(index_entry.clone());
+                }
             }
         }
 
@@ -646,7 +701,7 @@ impl Database {
         self.transaction_manager.begin_transaction(true)
     }
 
-    /// Commit a transaction with immediate conflict detection
+    /// Commit a transaction with atomic publication
     pub fn commit_transaction(&self, mut txn: Transaction, slot_id: Option<usize>) -> Result<()> {
         if txn.pending_writes.is_empty() {
             return self.transaction_manager.commit_transaction(txn, slot_id);
@@ -655,7 +710,7 @@ impl Database {
         // Use mutex for atomic commit to avoid races between conflict check and insert
         let _commit_guard = self.commit_mutex.lock().unwrap();
         
-        // Step 1: Check for write-write conflicts
+        // Step 1: Check for write-write conflicts (only against published writes)
         let current_index_ptr = self.index.load(Ordering::Acquire);
         let current_index = unsafe { &*current_index_ptr };
         
@@ -664,22 +719,28 @@ impl Database {
             let start_key = TemporalKey::new(morton_key, txn.start_timestamp + 1);
             let end_key = TemporalKey::new(morton_key, u64::MAX);
             
-            // Check if any version of this key was committed after our transaction started
+            // Check if any visible version of this key was committed after our transaction started
             for entry in current_index.range(start_key..=end_key) {
-                if entry.key().morton_key == morton_key {
+                if entry.key().morton_key == morton_key && entry.value().is_visible() {
                     self.transaction_manager.rollback_transaction(slot_id);
                     return Err(DatabaseError::TransactionConflict);
                 }
             }
         }
 
-        // Step 2: Directly insert writes into current index (fast path)
-        // This is atomic because we hold the commit mutex
-        for (temporal_key, entry) in txn.pending_writes.drain() {
+        // Step 2: Create write set for atomic publication
+        let write_set = WriteSet::new(txn.id);
+        
+        // Step 3: Insert all writes with unpublished write set
+        for (temporal_key, mut entry) in txn.pending_writes.drain() {
+            entry.write_set = Some(write_set.clone());
             current_index.insert(temporal_key, entry);
         }
 
-        // Step 3: Transaction committed successfully
+        // Step 4: Atomically publish all writes
+        write_set.publish();
+
+        // Step 5: Transaction committed successfully
         self.transaction_manager.commit_transaction(txn, slot_id)
     }
 
